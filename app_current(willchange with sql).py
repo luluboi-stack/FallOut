@@ -39,9 +39,48 @@ def find_local_file(candidates: List[str]) -> Optional[str]:
             return p
     return None
 
-LOCAL_BOM_PATH = find_local_file(["bom.csv", "BOM.csv", "BOM.CSV", "bom.xlsx", "BOM.xlsx", "BOM_UPDATED_PRESERVE_ALL.csv"])
+LOCAL_BOM_PATH = find_local_file(["BOM_FINAL_EXPLODED.parquet"])
 LOCAL_LX02_PATH = find_local_file(["lx02.csv", "LX02.csv", "LX02.CSV", "lx02.xlsx", "LX02.xlsx", "lx02.xls", "LX02.xls", "LMAO - Data.csv"])
 LOCAL_STO_PATH = find_local_file(["sto.csv", "STO.csv", "open_sto.csv", "open_sto.xlsx", "sto.xlsx", "SIT sep 13 pm.xlsx"])
+
+@st.cache_data(show_spinner="⚡ Loading 400K BOM into RAM (takes < 1 sec)...")
+def get_master_bom_df() -> pd.DataFrame:
+    """Loads 400K BOM once into RAM and caches it. Sub-second subsequent loads."""
+    # 1. Check if user manually uploaded a BOM
+    if "uploaded_bom_df" in st.session_state and not st.session_state["uploaded_bom_df"].empty:
+        return st.session_state["uploaded_bom_df"]
+
+    # 2. Check local files
+    if not LOCAL_BOM_PATH or not os.path.exists(LOCAL_BOM_PATH):
+        return pd.DataFrame()
+
+    file_path = LOCAL_BOM_PATH
+    parquet_cache = os.path.join(BASE_DIR, "bom.parquet")
+
+    # Fast path: Parquet exists
+    if file_path.endswith(".parquet"):
+        return pd.read_parquet(file_path)
+    
+    # If parquet cache exists and is newer than the source file
+    if os.path.exists(parquet_cache) and os.path.getmtime(parquet_cache) >= os.path.getmtime(file_path):
+        return pd.read_parquet(parquet_cache)
+
+    # Fast path: CSV
+    if file_path.endswith(".csv"):
+        df = pd.read_csv(file_path, dtype=str, low_memory=False)
+        try:
+            df.to_parquet(parquet_cache, compression="snappy")
+        except Exception:
+            pass
+        return df
+
+    # Slow path: XLSX (Convert once to Parquet so it never lags again)
+    df = pd.read_excel(file_path, dtype=str)
+    try:
+        df.to_parquet(parquet_cache, compression="snappy")
+    except Exception:
+        pass
+    return df
 
 # ---------------------------------------------------------
 # LOCAL DATABASE INITIALIZATION (REFRESH-SAFE & CONCURRENCY-SAFE)
@@ -1046,139 +1085,321 @@ def log_sap_upload(file_type: str, uploaded_file, df_loaded: pd.DataFrame):
 
 import io
 
+def locate_sap_header(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Finds the actual SAP table header beneath report banner rows.
+    Supports exports such as:
+    Row 1: WM Stock with Material Description
+    Row 2: Warehouse Number    WH5
+    Row 3: blank
+    Row 4: Storage Unit | Material | Material Description | ...
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+    raw_df = raw_df.dropna(how="all").reset_index(drop=True)
+    # Handle tables where pandas already detected the correct header.
+    existing_columns = {
+        str(column).replace("\ufeff", "").strip().lower()
+        for column in raw_df.columns
+    }
+    if (
+        "material" in existing_columns
+        and "storage unit" in existing_columns
+        and len(
+            existing_columns
+            & {
+                "storage type",
+                "storage bin",
+                "available stock",
+                "total stock",
+            }
+        ) >= 2
+    ):
+        result = raw_df.copy()
+        result.columns = [
+            str(column).replace("\ufeff", "").strip()
+            for column in result.columns
+        ]
+        return result.dropna(how="all").reset_index(drop=True)
+    # Search the first 50 rows for the actual SAP header.
+    for row_index in range(min(50, len(raw_df))):
+        cells = [
+            str(value).replace("\ufeff", "").strip()
+            if pd.notna(value)
+            else ""
+            for value in raw_df.iloc[row_index].tolist()
+        ]
+        normalized = {
+            value.lower()
+            for value in cells
+            if value and value.lower() != "nan"
+        }
+        required_columns = {"storage unit", "material"}
+        indicator_columns = {
+            "storage type",
+            "storage bin",
+            "available stock",
+            "total stock",
+        }
+        if (
+            required_columns.issubset(normalized)
+            and len(normalized & indicator_columns) >= 2
+        ):
+            valid_positions = [
+                index
+                for index, value in enumerate(cells)
+                if value and value.lower() != "nan"
+            ]
+            result = raw_df.iloc[row_index + 1 :, valid_positions].copy()
+            result.columns = [cells[index] for index in valid_positions]
+            result = result.dropna(how="all").reset_index(drop=True)
+            return result
+    return pd.DataFrame()
+
 def load_uploaded_file(uploaded_file) -> pd.DataFrame:
     """
-    Universal SAP File Ingestion Engine.
-    Handles:
-    - Native Excel (.xlsx, .xls)
-    - HTML / XML tables disguised as .csv (standard SAP GUI spreadsheet export)
-    - UTF-16LE, UTF-16, UTF-8-BOM, CP1252, Latin1 encodings
-    - Delimiters: comma (,), tab (\t), pipe (|), semicolon (;)
-    - Leading SAP report metadata banners and separator lines (e.g. |---|---|)
+    Universal SAP file ingestion engine.
+    Supports:
+    - Native Excel (.xlsx and .xls)
+    - HTML/XML tables disguised as CSV
+    - UTF-16LE, UTF-16, UTF-8-BOM, UTF-8, CP1252 and Latin1
+    - Tab, pipe, comma and semicolon delimiters
+    - SAP report banners and separator rows
     """
     if uploaded_file is None:
         return pd.DataFrame()
-
     file_name = getattr(uploaded_file, "name", "file").lower()
-    
-    # Read raw bytes to inspect magic headers
+    # Read the complete upload buffer.
     try:
         uploaded_file.seek(0)
         raw_bytes = uploaded_file.read()
         uploaded_file.seek(0)
-    except Exception as e:
-        st.error(f"❌ Could not read upload buffer for '{file_name}': {e}")
+    except Exception as exc:
+        st.error(f"❌ Could not read '{file_name}': {exc}")
         return pd.DataFrame()
-
     if not raw_bytes:
-        st.error(f"❌ File '{file_name}' is empty (0 bytes).")
+        st.error(f"❌ File '{file_name}' is empty.")
         return pd.DataFrame()
-
     df = None
-
-    # -------------------------------------------------------------
-    # 1. CHECK IF TRUE EXCEL ZIP (.XLSX) OR OLE (.XLS)
-    # -------------------------------------------------------------
-    # PK\x03\x04 is the ZIP signature (xlsx); \xD0\xCF\x11\xE0 is OLE (xls)
-    if raw_bytes.startswith(b"PK\x03\x04") or raw_bytes.startswith(b"\xd0\xcf\x11\xe0") or file_name.endswith((".xlsx", ".xls")):
+    # ---------------------------------------------------------
+    # 1. NATIVE EXCEL
+    # ---------------------------------------------------------
+    is_excel = (
+        raw_bytes.startswith(b"PK\x03\x04")
+        or raw_bytes.startswith(b"\xd0\xcf\x11\xe0")
+        or file_name.endswith((".xlsx", ".xls"))
+    )
+    if is_excel:
         try:
             uploaded_file.seek(0)
-            df = pd.read_excel(uploaded_file, dtype=str)
+            # Read without assuming that row 1 is the header.
+            raw_excel = pd.read_excel(
+                uploaded_file,
+                header=None,
+                dtype=str,
+            )
+            df = locate_sap_header(raw_excel)
         except Exception:
-            df = None  # Fall through to text parsers if Excel reader fails
-
-    # -------------------------------------------------------------
-    # 2. CHECK IF HTML TABLE DISGUISED AS CSV (COMMON SAP FORMAT)
-    # -------------------------------------------------------------
-    if df is None:
-        sample_head = raw_bytes[:1024].lower()
-        if b"<html" in sample_head or b"<table" in sample_head or b"<?xml" in sample_head:
-            for enc in ["utf-8", "utf-16", "utf-16le", "latin1", "cp1252"]:
+            # Allow text parsing when a file has an incorrect extension.
+            df = None
+    # ---------------------------------------------------------
+    # 2. HTML/XML TABLE DISGUISED AS CSV
+    # ---------------------------------------------------------
+    if df is None or df.empty:
+        sample_head = raw_bytes[:4096].lower()
+        if (
+            b"<html" in sample_head
+            or b"<table" in sample_head
+            or b"<?xml" in sample_head
+        ):
+            for encoding in [
+                "utf-8",
+                "utf-16",
+                "utf-16le",
+                "cp1252",
+                "latin1",
+            ]:
                 try:
-                    tables = pd.read_html(io.BytesIO(raw_bytes), encoding=enc)
-                    if tables and len(tables[0]) > 0:
-                        df = tables[0].astype(str)
+                    tables = pd.read_html(
+                        io.BytesIO(raw_bytes),
+                        encoding=encoding,
+                    )
+                    for table in tables:
+                        candidate = locate_sap_header(table)
+                        if not candidate.empty:
+                            df = candidate
+                            break
+                    if df is not None and not df.empty:
                         break
                 except Exception:
                     continue
-
-    # -------------------------------------------------------------
-    # 3. TEXT / CSV / TSV / PIPE-DELIMITED SAP TABLE PARSER
-    # -------------------------------------------------------------
-    if df is None:
-        # Detect Text Encoding
+    # ---------------------------------------------------------
+    # 3. TEXT / CSV / TSV / PIPE-DELIMITED FILE
+    # ---------------------------------------------------------
+    if df is None or df.empty:
         decoded_text = None
-        for enc in ["utf-16", "utf-16le", "utf-8-sig", "utf-8", "cp1252", "latin1"]:
+        for encoding in [
+            "utf-16",
+            "utf-16le",
+            "utf-8-sig",
+            "utf-8",
+            "cp1252",
+            "latin1",
+        ]:
             try:
-                decoded_text = raw_bytes.decode(enc)
-                # Ensure we didn't just decode gibberish
-                if any(k in decoded_text.lower() for k in ["material", "matnr", "plant", "stock", "qty", "sloc", "order", "document"]):
+                candidate_text = raw_bytes.decode(encoding)
+                contains_sap_terms = any(
+                    keyword in candidate_text.lower()
+                    for keyword in [
+                        "material",
+                        "matnr",
+                        "plant",
+                        "stock",
+                        "storage unit",
+                        "storage bin",
+                        "qty",
+                        "sloc",
+                        "order",
+                        "document",
+                    ]
+                )
+                if contains_sap_terms:
+                    decoded_text = candidate_text
                     break
             except Exception:
                 continue
-
         if decoded_text is None:
-            try:
-                decoded_text = raw_bytes.decode("latin1", errors="ignore")
-            except Exception:
-                pass
-
-        if decoded_text:
-            raw_lines = decoded_text.splitlines()
-            
-            # Find the actual table header line (skip SAP report titles, dates, and dividing lines)
-            header_idx = 0
-            for idx, line in enumerate(raw_lines[:30]):
-                l_lower = line.lower().strip()
-                # Skip divider lines like |-----------|-----------|
-                if set(l_lower).issubset({"-", "=", "+", "|", " ", "\t"}):
+            decoded_text = raw_bytes.decode(
+                "latin1",
+                errors="ignore",
+            )
+        raw_lines = decoded_text.splitlines()
+        header_index = None
+        detected_separator = None
+        # Locate the actual table header beneath the SAP banner.
+        for line_index, line in enumerate(raw_lines[:50]):
+            cleaned_line = line.replace("\ufeff", "").strip()
+            if not cleaned_line:
+                continue
+            if set(cleaned_line).issubset(
+                {"-", "=", "+", "|", " ", "\t"}
+            ):
+                continue
+            for separator in ["\t", "|", ",", ";"]:
+                if separator not in line:
                     continue
-                # Match line with SAP column keywords
-                has_mat = any(k in l_lower for k in ["material", "matnr", "child material", "part id", "part no", "component"])
-                has_aux = any(k in l_lower for k in ["plant", "storage", "bin", "qty", "unrestricted", "desc", "order", "batch", "po "])
-                if has_mat or (has_aux and ("|" in line or "\t" in line or "," in line)):
-                    header_idx = idx
+                cells = {
+                    value.strip().lower()
+                    for value in line.split(separator)
+                    if value.strip()
+                }
+                required_columns = {"storage unit", "material"}
+                indicator_columns = {
+                    "storage type",
+                    "storage bin",
+                    "available stock",
+                    "total stock",
+                }
+                is_lx02_header = (
+                    required_columns.issubset(cells)
+                    and len(cells & indicator_columns) >= 2
+                )
+                # Generic fallback for other SAP dumps.
+                has_material = any(
+                    column in cells
+                    for column in {
+                        "material",
+                        "matnr",
+                        "child material",
+                        "part id",
+                        "part no",
+                        "component",
+                    }
+                )
+                has_supporting_column = any(
+                    column in cells
+                    for column in {
+                        "plant",
+                        "storage location",
+                        "storage bin",
+                        "quantity",
+                        "qty",
+                        "unrestricted",
+                        "available stock",
+                        "order",
+                        "purchasing document",
+                    }
+                )
+                if is_lx02_header or (
+                    has_material and has_supporting_column
+                ):
+                    header_index = line_index
+                    detected_separator = separator
                     break
-
-            cleaned_content = "\n".join(raw_lines[header_idx:])
-
-            # Try parsing with all SAP delimiters
-            for sep in ["\t", "|", ",", ";"]:
-                try:
-                    temp_df = pd.read_csv(
-                        io.StringIO(cleaned_content),
-                        sep=sep,
-                        dtype=str,
-                        on_bad_lines="skip",
-                        skipinitialspace=True
-                    )
-                    # Drop empty ghost columns caused by leading/trailing pipes (e.g. | col1 | col2 |)
-                    temp_df = temp_df.loc[:, ~temp_df.columns.str.contains(r"^Unnamed")]
-                    temp_df.columns = [str(c).strip() for c in temp_df.columns]
-                    temp_df = temp_df.dropna(how="all")
-
-                    if len(temp_df.columns) > 1 and len(temp_df) > 0:
-                        df = temp_df
-                        break
-                except Exception:
-                    continue
-
-    # -------------------------------------------------------------
-    # 4. FINAL CLEANUP & SANITY CHECK
-    # -------------------------------------------------------------
+            if header_index is not None:
+                break
+        if header_index is not None and detected_separator:
+            cleaned_content = "\n".join(
+                raw_lines[header_index:]
+            )
+            try:
+                candidate_df = pd.read_csv(
+                    io.StringIO(cleaned_content),
+                    sep=detected_separator,
+                    dtype=str,
+                    on_bad_lines="skip",
+                    skipinitialspace=True,
+                )
+                # Remove empty columns caused by leading/trailing pipes.
+                candidate_df = candidate_df.loc[
+                    :,
+                    ~candidate_df.columns.astype(str).str.contains(
+                        r"^Unnamed",
+                        case=False,
+                        regex=True,
+                    ),
+                ]
+                candidate_df.columns = [
+                    str(column)
+                    .replace("\ufeff", "")
+                    .strip()
+                    for column in candidate_df.columns
+                ]
+                candidate_df = candidate_df.dropna(how="all")
+                if (
+                    len(candidate_df.columns) > 1
+                    and not candidate_df.empty
+                ):
+                    df = candidate_df
+            except Exception:
+                df = None
+    # ---------------------------------------------------------
+    # 4. FINAL VALIDATION AND CLEANUP
+    # ---------------------------------------------------------
     if df is None or df.empty:
-        st.error(f"❌ File '{file_name}' was loaded but contains 0 parseable rows. Please ensure the file contains tabular data.")
+        st.error(
+            f"❌ File '{file_name}' contains no parseable table. "
+            "The SAP column header could not be located."
+        )
         return pd.DataFrame()
-
-    # Clean ghost column names and whitespace
-    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
-    
-    # Filter out dashed divider rows that slipped past header detection
-    first_col = df.columns[0]
-    df = df[~df[first_col].astype(str).str.contains(r"^[-=+|]+$")]
-
-    return df
-
+    df.columns = [
+        str(column).replace("\ufeff", "").strip()
+        for column in df.columns
+    ]
+    # Remove fully empty rows.
+    df = df.dropna(how="all")
+    # Remove SAP divider rows such as |-----|-----|.
+    if len(df.columns) > 0:
+        first_column = df.columns[0]
+        divider_mask = (
+            df[first_column]
+            .astype(str)
+            .str.strip()
+            .str.fullmatch(r"[-=+|]+", na=False)
+        )
+        df = df[~divider_mask]
+    return df.reset_index(drop=True)
+   
 def check_hold_to_plan_transitions(current_batches: pd.DataFrame) -> List[str]:
     current_state = {}
     for _, b in current_batches.iterrows():
@@ -1335,31 +1556,56 @@ def record_audit_run(run_id: str, audit_records: List[dict]):
     # Flush WAL memory buffer straight into disk file
     flush_db_to_disk()
 
-def extract_detailed_stock_maps(mb52_df: pd.DataFrame):
-    if mb52_df.empty:
+def extract_detailed_stock_maps(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame = None):
+    if mb52_df.empty and (lx02_df is None or lx02_df.empty):
         return {}, {}, {}, {}, {}
 
-    mb = mb52_df.copy()
-    mb.columns = [str(c).strip() for c in mb.columns]
-    
-    mat_col = find_column_by_priority(mb, ["material", "matnr", "part"]) or mb.columns[0]
-    plant_col = find_column_by_priority(mb, ["plant", "plnt", "werks"]) or "Plant"
-    sloc_col = find_column_by_priority(mb, ["storage location", "sloc", "lgort"]) or "Storage Location"
-    qty_col = find_column_by_priority(mb, ["unrestricted", "available", "stock", "labst"]) or mb.columns[-1]
+    m002_rm01, m002_ps01, m002_pv01, w004_rm01, w004_total = {}, {}, {}, {}, {}
 
-    mb["Mat_Clean"] = mb[mat_col].apply(clean_sap_key)
-    mb["Plant_Clean"] = mb[plant_col].astype(str).str.strip().str.upper()
-    mb["SLoc_Clean"] = mb[sloc_col].astype(str).str.strip().str.upper()
-    mb["Clean_Qty"] = pd.to_numeric(mb[qty_col].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
+    if not mb52_df.empty:
+        mb = mb52_df.copy()
+        mb.columns = [str(c).strip() for c in mb.columns]
 
-    m002_rm01 = mb[(mb["Plant_Clean"].str.contains("M002")) & (mb["SLoc_Clean"] == "RM01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
-    m002_ps01 = mb[(mb["Plant_Clean"].str.contains("M002")) & (mb["SLoc_Clean"] == "PS01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
-    m002_pv01 = mb[(mb["Plant_Clean"].str.contains("M002")) & (mb["SLoc_Clean"] == "PV01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
-    w004_rm01 = mb[(mb["Plant_Clean"].str.contains("W004")) & (mb["SLoc_Clean"] == "RM01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
-    w004_total = mb[mb["Plant_Clean"].str.contains("W004")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+        mat_col = find_column_by_priority(mb, ["material", "matnr", "part"], exclude=["desc", "text"]) or mb.columns[0]
+        plant_col = find_column_by_priority(mb, ["plant", "plnt", "werks"], exclude=["desc", "text", "name"]) or "Plant"
+        sloc_col = find_column_by_priority(mb, ["storage location", "sloc", "lgort"], exclude=["desc", "text", "name"]) or "Storage Location"
+        qty_col = find_column_by_priority(mb, ["unrestricted", "available", "stock", "labst"], exclude=["val", "value", "price"]) or mb.columns[-1]
+
+        mb["Mat_Clean"] = mb[mat_col].apply(clean_sap_key)
+        mb["Plant_Clean"] = mb[plant_col].astype(str).str.strip().str.upper()
+        mb["SLoc_Clean"] = mb[sloc_col].astype(str).str.strip().str.upper()
+        mb["Clean_Qty"] = pd.to_numeric(mb[qty_col].astype(str).str.replace(",", "").str.strip(), errors="coerce").fillna(0.0)
+
+        m002_mask = mb["Plant_Clean"].str.contains("M002")
+        w004_mask = mb["Plant_Clean"].str.contains("W004")
+
+        m002_rm01 = mb[m002_mask & mb["SLoc_Clean"].str.contains("RM01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+        m002_ps01 = mb[m002_mask & mb["SLoc_Clean"].str.contains("PS01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+        m002_pv01 = mb[m002_mask & mb["SLoc_Clean"].str.contains("PV01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+
+        # Matches "RM01" or "RM01 G Stock Store"
+        w004_rm01 = mb[w004_mask & mb["SLoc_Clean"].str.contains("RM01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+        w004_total = mb[w004_mask].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+
+    # Fallback to LX02 if MB52 has 0
+    if lx02_df is not None and not lx02_df.empty:
+        lx = lx02_df.copy()
+        lx_mat_col = find_column_by_priority(lx, ["material", "matnr"], exclude=["desc", "text"])
+        lx_qty_col = find_column_by_priority(lx, ["available stock", "verme", "unrestricted", "available", "total stock"])
+        
+        if lx_mat_col and lx_qty_col:
+            lx["Mat_Clean"] = lx[lx_mat_col].apply(clean_sap_key)
+            lx["Clean_Qty"] = pd.to_numeric(lx[lx_qty_col].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
+            lx_stock_map = lx.groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+
+            for mat, q in lx_stock_map.items():
+                if w004_rm01.get(mat, 0) == 0:
+                    w004_rm01[mat] = q
+                if w004_total.get(mat, 0) == 0:
+                    w004_total[mat] = q
 
     return m002_rm01, m002_ps01, m002_pv01, w004_rm01, w004_total
-
+   
 def classify_material_decision(
     demand: float,
     m002_avail: float,
@@ -1435,12 +1681,9 @@ def calculate_band2_and_pss_engine(
     active_seq_keys: Set[str],
     calc_formula_mode: str = "Standard Net Deficit"
 ) -> pd.DataFrame:
-    if "uploaded_bom_df" in st.session_state and not st.session_state["uploaded_bom_df"].empty:
-        bom_df = st.session_state["uploaded_bom_df"].copy()
-    elif LOCAL_BOM_PATH and os.path.exists(LOCAL_BOM_PATH):
-        bom_df = pd.read_csv(LOCAL_BOM_PATH, dtype=str) if LOCAL_BOM_PATH.endswith(".csv") else pd.read_excel(LOCAL_BOM_PATH, dtype=str)
-    else:
-        st.error("🚨 BOM file (`bom.csv`) not found. Upload it in the sidebar.")
+    bom_df = get_master_bom_df()
+    if bom_df.empty:
+        st.error("🚨 BOM file not found. Upload it in the sidebar.")
         return pd.DataFrame()
 
     plan_batches = batches_df[batches_df["Status"] == "PLAN"].copy()
@@ -1572,32 +1815,41 @@ def calculate_band2_and_pss_engine(
         })
     aggregated = pd.DataFrame(grouped)
 
-    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, _ = extract_detailed_stock_maps(mb52_df)
+    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = extract_detailed_stock_maps(mb52_df, lx02_in)
     cogi_map = process_cogi_dump(cogi_df)
     sto_qty_dict, sto_po_dict = process_open_sto(sto_df)
 
     final_records = []
+    # 2. Inside the loop over aggregated parts:
     for _, r in aggregated.iterrows():
         part_id = r["Child Material"]
-        clean_pid = clean_sap_key(part_id)
+        clean_pid = clean_sap_key(part_id)      # 👈 clean_pid is defined here!
         req = int(r["Total_Demand"])
 
         m002_raw = m002_rm01_map.get(clean_pid, 0.0) + m002_ps01_map.get(clean_pid, 0.0)
         cogi_qty = int(cogi_map.get(clean_pid, 0.0))
-        w004 = int(w004_rm01_map.get(clean_pid, 0.0))
+        
+        # 👈 Put this line HERE, indented inside the loop:
+        w004 = int(w004_rm01_map.get(clean_pid, w004_tot_map.get(clean_pid, 0.0)))
+        
         open_sto = int(sto_qty_dict.get(clean_pid, 0))
         open_pos = sto_po_dict.get(clean_pid, "")
 
         effective_m002 = max(0.0, m002_raw - cogi_qty)
         prior_drain = preceding_drain.get(clean_pid, 0.0)
-        true_m002_available = max(0.0, effective_m002 - prior_drain)
-
-        total_pipeline = true_m002_available + open_sto
-
-        if "Experimental Additive" in calc_formula_mode:
-            demand_to_fulfil = max(0, int(req + cogi_qty - true_m002_available - open_sto))
+        preceding_balance = effective_m002 - prior_drain
+        
+        if preceding_balance < 0:
+            preceding_starvation_deficit = abs(preceding_balance)
+            usable_floor_for_target = 0.0
         else:
-            demand_to_fulfil = max(0, int(req - total_pipeline))
+            preceding_starvation_deficit = 0.0
+            usable_floor_for_target = preceding_balance
+
+        gross_deficit = preceding_starvation_deficit + req
+        demand_to_fulfil = max(0, int(gross_deficit - open_sto - usable_floor_for_target))
+        total_pipeline = max(0.0, usable_floor_for_target + open_sto)
+
 
         box_size, p_type = get_official_pss(part_id, r["Description"])
 
@@ -2035,8 +2287,7 @@ if need_recompute:
 
     # Load BOM to identify every part in the plant
     bom_source = st.session_state.get("uploaded_bom_df", pd.DataFrame())
-    if bom_source.empty and LOCAL_BOM_PATH and os.path.exists(LOCAL_BOM_PATH):
-        bom_source = pd.read_csv(LOCAL_BOM_PATH, dtype=str) if LOCAL_BOM_PATH.endswith(".csv") else pd.read_excel(LOCAL_BOM_PATH, dtype=str)
+    bom_source = get_master_bom_df()
 
     c_col = find_column_by_priority(bom_source, ["child material", "child_material", "component", "material", "part"])
     p_col = find_column_by_priority(bom_source, ["parent material", "parent_material", "parent", "sku", "vehicle"])
@@ -2191,10 +2442,11 @@ with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All P
             all_known_parts.update(b_df[c_col].dropna().astype(str).str.strip().unique())
     elif LOCAL_BOM_PATH and os.path.exists(LOCAL_BOM_PATH):
         try:
-            b_df = pd.read_csv(LOCAL_BOM_PATH, dtype=str) if LOCAL_BOM_PATH.endswith(".csv") else pd.read_excel(LOCAL_BOM_PATH, dtype=str)
-            c_col = find_column_by_priority(b_df, ["child material", "component", "material", "part"])
-            if c_col:
-                all_known_parts.update(b_df[c_col].dropna().astype(str).str.strip().unique())
+            b_df = get_master_bom_df()
+            if not b_df.empty:
+                c_col = find_column_by_priority(b_df, ["child material", "component", "material", "part"])
+                if c_col:
+                    all_known_parts.update(b_df[c_col].dropna().astype(str).str.strip().unique())
         except Exception:
             pass
 
@@ -2276,8 +2528,7 @@ with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All P
 
                 # Check if part exists in BOM
                 bom_source = st.session_state.get("uploaded_bom_df", pd.DataFrame())
-                if bom_source.empty and LOCAL_BOM_PATH and os.path.exists(LOCAL_BOM_PATH):
-                    bom_source = pd.read_csv(LOCAL_BOM_PATH, dtype=str) if LOCAL_BOM_PATH.endswith(".csv") else pd.read_excel(LOCAL_BOM_PATH, dtype=str)
+                bom_source = get_master_bom_df()
 
                 c_col = find_column_by_priority(bom_source, ["child material", "component", "material", "part"])
                 p_col = find_column_by_priority(bom_source, ["parent material", "parent", "sku", "vehicle"])
@@ -2321,16 +2572,15 @@ with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All P
         st.caption("Live decision breakdown for EVERY component in the plant (including cutoff & HOLD parts).")
 
         # 1. Load Master BOM to ensure 100% of factory parts are audited
-        bom_source = st.session_state.get("uploaded_bom_df", pd.DataFrame())
-        if bom_source.empty and LOCAL_BOM_PATH and os.path.exists(LOCAL_BOM_PATH):
-            bom_source = pd.read_csv(LOCAL_BOM_PATH, dtype=str) if LOCAL_BOM_PATH.endswith(".csv") else pd.read_excel(LOCAL_BOM_PATH, dtype=str)
+        bom_source = get_master_bom_df()
 
         c_col = find_column_by_priority(bom_source, ["child material", "child_material", "component", "material", "part"])
         p_col = find_column_by_priority(bom_source, ["parent material", "parent_material", "parent", "sku", "vehicle", "model"])
         d_col = find_column_by_priority(bom_source, ["description", "material description", "component description"])
 
         # Ingest live stock maps
-        m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, _ = extract_detailed_stock_maps(mb52_in)
+        m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = (
+        extract_detailed_stock_maps(mb52_in, lx02_raw) )
         sto_q_map, _ = process_open_sto(sto_in)
 
         # 2. Build indexed lookup of master_df for fast matching
@@ -2345,14 +2595,19 @@ with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All P
         bom_desc_map = {}
 
         if not bom_source.empty and c_col and p_col:
-            for _, b_row in bom_source.iterrows():
-                c_clean = clean_sap_key(b_row[c_col])
-                p_raw = str(b_row[p_col]).strip()
-                if c_clean:
-                    all_part_keys.add(c_clean)
-                    bom_parent_map.setdefault(c_clean, set()).add(p_raw)
-                    if d_col and str(b_row.get(d_col, "")).strip():
-                        bom_desc_map[c_clean] = str(b_row[d_col]).strip()
+            # 1. Deduplicate to unique components first
+            unique_bom = bom_source[[c_col, p_col] + ([d_col] if d_col else [])].dropna(subset=[c_col]).drop_duplicates(subset=[c_col])
+            
+            clean_children = [clean_sap_key(x) for x in unique_bom[c_col].values]
+            parents = unique_bom[p_col].astype(str).str.strip().values
+            all_part_keys.update(clean_children)
+
+            for c_clean, p_raw in zip(clean_children, parents):
+                bom_parent_map.setdefault(c_clean, set()).add(p_raw)
+
+            if d_col:
+                descriptions = unique_bom[d_col].astype(str).str.strip().values
+                bom_desc_map = dict(zip(clean_children, descriptions))
 
         audit_table_data = []
 
@@ -2384,7 +2639,7 @@ with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All P
             # CASE B: Part is in BOM, but was EXCLUDED from current horizon
             else:
                 pid = clean_p
-                w004 = int(w004_rm01_map.get(clean_p, 0))
+                w004 = int(w004_rm01_map.get(clean_p, 0) or w004_tot_map.get(clean_p, 0))
                 m002_eff = int(m002_rm01_map.get(clean_p, 0) + m002_ps01_map.get(clean_p, 0) + sto_q_map.get(clean_p, 0))
                 demand = 0
                 pick_q = 0
