@@ -27,7 +27,6 @@ from data_sources import (
     frame_fingerprint,
 )
 from picklist_engine import (
-    WALK_COLUMNS,
     StockBalances,
     audit_decision,
     clean_sap_key,
@@ -35,7 +34,15 @@ from picklist_engine import (
     find_column_by_priority,
     order_plan_sequences,
     run_walk,
-    select_rows,
+)
+from walk_store import (
+    WALK_NEW,
+    WALK_REUSE,
+    claim_walk_run,
+    find_walk_run,
+    init_walk_tables,
+    load_walk_rows,
+    walk_action,
 )
 
 # ---------------------------------------------------------
@@ -192,54 +199,7 @@ def init_db():
                 raw_json TEXT
             )
         """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS picklist_walk_run (
-                walk_run_id TEXT PRIMARY KEY,
-                snapshot_id TEXT,
-                batch_fingerprint TEXT,
-                source TEXT,
-                timestamp DATETIME,
-                client_ip TEXT,
-                sequence_count INTEGER,
-                material_count INTEGER,
-                total_trigger REAL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS picklist_walk (
-                walk_run_id TEXT,
-                walk_order INTEGER,
-                line TEXT,
-                sequence_no INTEGER,
-                seq_key TEXT,
-                sku TEXT,
-                batch_count INTEGER,
-                minute_offset INTEGER,
-                part_id TEXT,
-                part_key TEXT,
-                description TEXT,
-                need REAL,
-                plant_taken REAL,
-                sto_taken REAL,
-                w004_taken REAL,
-                trigger REAL,
-                shortfall REAL,
-                status TEXT,
-                plant_after REAL,
-                sto_after REAL,
-                w004_after REAL,
-                pss_qty INTEGER,
-                pss_type TEXT,
-                m002_stock REAL,
-                cogi_qty REAL,
-                plant_opening REAL,
-                sto_opening REAL,
-                w004_opening REAL,
-                open_po_numbers TEXT,
-                snapshot_id TEXT
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_picklist_walk_run ON picklist_walk (walk_run_id)")
+        init_walk_tables(conn)
 
 init_db()
 
@@ -1533,26 +1493,6 @@ def record_audit_run(run_id: str, audit_records: List[dict]):
     # Flush WAL memory buffer straight into disk file
     flush_db_to_disk()
 
-def record_walk_run(walk_run_id: str, walk_df: pd.DataFrame, header: dict):
-    """One walk = one header row plus every walk row, triggered or not."""
-    rows = walk_df[WALK_COLUMNS].copy()
-    rows.insert(0, "walk_run_id", walk_run_id)
-    with get_db_connection() as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO picklist_walk_run
-            (walk_run_id, snapshot_id, batch_fingerprint, source, timestamp, client_ip,
-             sequence_count, material_count, total_trigger)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            walk_run_id, header["snapshot_id"], header["batch_fingerprint"], header["source"],
-            header["timestamp"], header["client_ip"], int(header["sequence_count"]),
-            int(header["material_count"]), float(header["total_trigger"]),
-        ))
-        if not rows.empty:
-            rows.to_sql("picklist_walk", conn, if_exists="append", index=False)
-        conn.commit()
-    flush_db_to_disk()
-
 def extract_detailed_stock_maps(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame = None):
     if mb52_df.empty and (lx02_df is None or lx02_df.empty):
         return {}, {}, {}, {}, {}
@@ -2323,23 +2263,44 @@ new_walk = (
     st.session_state.pop("force_recalculate", False)
 )
 
+write_audit = False
+
 if new_walk:
-    if bom_for_walk.empty:
-        st.error("🚨 BOM file not found. Upload it in the sidebar.")
-    walk_df = compute_sequence_walk(
-        batches_df, bom_for_walk, mb52_in, cogi_in, sto_in, lx02_in, sap_snapshot.snapshot_id
-    )
-    walk_run_id = f"walk_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    record_walk_run(walk_run_id, walk_df, {
-        "snapshot_id": sap_snapshot.snapshot_id,
-        "batch_fingerprint": batch_fingerprint,
-        "source": sap_snapshot.source,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "client_ip": get_client_ip(),
-        "sequence_count": plan_sequences["seq_key"].nunique(),
-        "material_count": walk_df["part_key"].nunique() if not walk_df.empty else 0,
-        "total_trigger": walk_df["trigger"].sum() if not walk_df.empty else 0.0,
-    })
+    with get_db_connection() as conn:
+        existing_run_id = (
+            find_walk_run(conn, sap_snapshot.snapshot_id, batch_fingerprint)
+            if sap_snapshot.is_complete else None
+        )
+        action = walk_action(sap_snapshot.is_complete, existing_run_id)
+        walk_df = load_walk_rows(conn, existing_run_id) if action == WALK_REUSE else None
+    walk_run_id = existing_run_id
+
+    if walk_df is None:
+        if bom_for_walk.empty:
+            st.error("🚨 BOM file not found. Upload it in the sidebar.")
+        walk_df = compute_sequence_walk(
+            batches_df, bom_for_walk, mb52_in, cogi_in, sto_in, lx02_in, sap_snapshot.snapshot_id
+        )
+
+    if action == WALK_NEW:
+        with get_db_connection() as conn:
+            walk_run_id, write_audit = claim_walk_run(
+                conn,
+                f"walk_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+                walk_df,
+                {
+                    "snapshot_id": sap_snapshot.snapshot_id,
+                    "batch_fingerprint": batch_fingerprint,
+                    "source": sap_snapshot.source,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "client_ip": get_client_ip(),
+                    "sequence_count": plan_sequences["seq_key"].nunique(),
+                    "material_count": walk_df["part_key"].nunique() if not walk_df.empty else 0,
+                    "total_trigger": walk_df["trigger"].sum() if not walk_df.empty else 0.0,
+                },
+            )
+        flush_db_to_disk()
+
     st.session_state["walk_df"] = walk_df
     st.session_state["walk_key"] = walk_key
     st.session_state["walk_run_id"] = walk_run_id
@@ -2354,15 +2315,13 @@ st.session_state["cached_master_df"] = master_df
 if not walk_df.empty and master_df.empty:
     st.warning("⚠️ No batches selected in the dispatch horizon.")
 
-if new_walk:
+if write_audit:
     # -------------------------------------------------------------
-    # 🚀 WRITE ALL PARTS (INCLUDED & CUTOFF) TO SQLITE DATABASE
+    # 🚀 WRITE THE FULL WALK (EVERY SEQUENCE, BOTH LINES) TO SQLITE, ONCE PER PICKLIST
     # -------------------------------------------------------------
     run_id = walk_run_id
-    sto_taken_by_part = (
-        select_rows(line_walk_df, selected_seq_keys).groupby("part_key")["sto_taken"].sum().to_dict()
-        if not line_walk_df.empty else {}
-    )
+    audit_df = consolidate(walk_df, None)
+    sto_taken_by_part = walk_df.groupby("part_key")["sto_taken"].sum().to_dict() if not walk_df.empty else {}
     m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = extract_detailed_stock_maps(mb52_in)
     sto_q_map, sto_po_map = process_open_sto(sto_in)
 
@@ -2373,12 +2332,12 @@ if new_walk:
     c_col = find_column_by_priority(bom_source, ["child material", "child_material", "component", "material", "part"])
     p_col = find_column_by_priority(bom_source, ["parent material", "parent_material", "parent", "sku", "vehicle"])
     
-    master_keys = set(master_df["Part ID"].apply(clean_sap_key)) if not master_df.empty else set()
+    master_keys = set(audit_df["Part ID"].apply(clean_sap_key)) if not audit_df.empty else set()
     audit_batch = []
 
-    # 1. Log all Active Horizon Parts
-    if not master_df.empty:
-        for _, r in master_df.iterrows():
+    # 1. Log every part on any PLAN sequence of the walk
+    if not audit_df.empty:
+        for _, r in audit_df.iterrows():
             pid = str(r["Part ID"]).strip()
             clean_pid = clean_sap_key(pid)
             seq_num = int(r["Sequence_Order"])
@@ -2399,13 +2358,13 @@ if new_walk:
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "client_ip": get_client_ip(),
                 "calculation_mode": calc_mode,
-                "line": str(line_filter),
+                "line": "All",
                 "sequence_no": seq_num,
                 "sku_name": sku_name,
                 "serial_no_start": 0,
                 "serial_no_end": 0,
                 "batch_plan_qty": 0,
-                "is_cutoff_sequence": any(f"#{seq_num}" in str(k) for k in cutoff_seq_keys),
+                "is_cutoff_sequence": False,
                 "part_id": pid,
                 "part_description": str(r["Part Name"]),
                 "storage_bin": str(r.get("Location", "-")),
@@ -2455,7 +2414,7 @@ if new_walk:
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "client_ip": get_client_ip(),
                     "calculation_mode": calc_mode,
-                    "line": str(line_filter),
+                    "line": "All",
                     "sequence_no": 0,
                     "sku_name": "Excluded_Batch",
                     "serial_no_start": 0,
@@ -2484,7 +2443,7 @@ if new_walk:
                     "effective_pipeline_total": float(m_rm01),
                     "picklist_status": "REJECTED",
                     "decision_code": "REJECTED_HORIZON_CUTOFF",
-                    "decision_reason": f"Part excluded by {target_dispatch_qty or 180}m horizon cutoff or HOLD batch status.",
+                    "decision_reason": "Part is not on any PLAN sequence in this walk (not scheduled, or HOLD).",
                     "demand_to_fulfil": 0.0,
                     "need_to_be_picked": 0.0,
                     "pss_boxes_to_pick": 0,

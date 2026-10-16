@@ -129,7 +129,7 @@ def order_plan_sequences(batches_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_bom_explosion(bom_df: pd.DataFrame, handled_units: Set[str]) -> Callable[[str], List[dict]]:
-    """Returns sku -> [{part_id, description, unit_qty}], using the ver3 recursion and handled-unit rule."""
+    """Returns sku -> [{part_id, description, unit_qty}], using the app's BOM recursion and handled-unit rule."""
     bom = bom_df.copy()
     bom.columns = [str(c).strip() for c in bom.columns]
     parent_col = find_column_by_priority(bom, ["parent material", "parent", "sku", "vehicle"]) or "Parent Material"

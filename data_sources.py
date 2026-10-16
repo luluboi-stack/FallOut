@@ -41,6 +41,11 @@ class SapSnapshot:
     snapshot_id: str
     source: str
 
+    @property
+    def is_complete(self) -> bool:
+        """A picklist is only logged once MB52, COGI, and STO are all loaded."""
+        return not (self.mb52.empty or self.cogi.empty or self.sto.empty)
+
 
 def frame_fingerprint(*frames: Optional[pd.DataFrame]) -> str:
     h = hashlib.sha256()
@@ -108,7 +113,7 @@ class DatabricksSettings:
 class DatabricksSource:
     """MB52, COGI, and STO from Databricks tables. Not live until the table schemas are shared.
 
-    Frames must come back with the column names the ver3 parsers already find
+    Frames must come back with the column names the app's SAP parsers already find
     (material, plant, storage location, unrestricted, ...), so the walk is unaware of the source.
     Snapshot id is the latest load timestamp across the three tables.
     """
