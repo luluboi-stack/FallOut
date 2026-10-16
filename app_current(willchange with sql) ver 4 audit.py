@@ -26,6 +26,7 @@ from data_sources import (
     SapUploadSource,
     frame_fingerprint,
 )
+from drive_export import DRIVE_NOT_CONFIGURED, DriveResult, drive_settings_missing, export_run_json
 from picklist_engine import (
     StockBalances,
     audit_decision,
@@ -1470,9 +1471,9 @@ AUDIT_VAULT_DIR = os.path.join(BASE_DIR, "audit_vault")
 os.makedirs(os.path.join(AUDIT_VAULT_DIR, "runs_csv"), exist_ok=True)
 os.makedirs(os.path.join(AUDIT_VAULT_DIR, "runs_json"), exist_ok=True)
 
-def record_audit_run(run_id: str, audit_records: List[dict]):
+def record_audit_run(run_id: str, audit_records: List[dict]) -> Optional[DriveResult]:
     if not audit_records:
-        return
+        return None
 
     df_run = pd.DataFrame(audit_records)
 
@@ -1492,6 +1493,9 @@ def record_audit_run(run_id: str, audit_records: List[dict]):
 
     # Flush WAL memory buffer straight into disk file
     flush_db_to_disk()
+
+    # 4. Replace the shared Drive picklist.csv with this run's JSON
+    return export_run_json(json_path, AUDIT_VAULT_DIR)
 
 def extract_detailed_stock_maps(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame = None):
     if mb52_df.empty and (lx02_df is None or lx02_df.empty):
@@ -2454,7 +2458,21 @@ if write_audit:
                 audit_batch.append(record_item)
 
     # Commit all parts to SQLite
-    record_audit_run(run_id, audit_batch)
+    st.session_state["drive_result"] = record_audit_run(run_id, audit_batch)
+
+drive_result = st.session_state.get("drive_result")
+if drive_result is None:
+    drive_missing = drive_settings_missing()
+    if drive_missing:
+        st.sidebar.caption(f"☁️ Drive not configured (missing {', '.join(drive_missing)}).")
+    else:
+        st.sidebar.caption("☁️ Drive picklist.csv updates on the next new picklist.")
+elif drive_result.ok:
+    st.sidebar.success(f"☁️ {drive_result.message}")
+elif drive_result.status == DRIVE_NOT_CONFIGURED:
+    st.sidebar.caption(f"☁️ {drive_result.message}")
+else:
+    st.sidebar.error(f"☁️ {drive_result.message}")
 
 
 # ---------------------------------------------------------
