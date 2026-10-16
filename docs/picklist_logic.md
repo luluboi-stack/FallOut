@@ -5,7 +5,7 @@ One walk runs right after each SAP pull (MB52, COGI, STO) or ScaleX plan change.
 ## Backend walk (`run_walk`)
 
 1. Sequences: ScaleX batches with `Status == "PLAN"` (HOLD is never walked), ordered by `ScaleX_Sequence_No`, then line. Both lines draw from the same balance per material.
-2. Each sequence is exploded to materials with the ver3 BOM recursion. A child listed in `OFFICIAL_PSS_MASTER` is a handled unit and is not dissolved. Need = unit qty × batch count.
+2. Each sequence is exploded to materials with the app's BOM recursion. A child listed in `OFFICIAL_PSS_MASTER` is a handled unit and is not dissolved. Need = unit qty × batch count.
 3. Balance per material, set once:
    - plant = max(0, M002 RM01 + PS01 − COGI)
    - sto = open STO (W004 ➡️ M002)
@@ -75,12 +75,22 @@ Trigger 30 per sequence, PSS 50:
 
 - `picklist_walk_run`: one row per walk (walk run id, snapshot id, batch fingerprint, source, timestamp, sequence count, material count, total trigger).
 - `picklist_walk`: every walk row for that walk run id.
-- `material_decision_audit`: written once per walk with `audit_run_id = walk_run_id`, from the consolidated picklist for the selection active when the walk ran. One walk = one log = one picklist.
+- `material_decision_audit` and the audit vault (`audit_vault/runs_json/<id>.json`, `audit_vault/runs_csv/<id>.csv`): `audit_run_id = walk_run_id`.
+
+## Audit rule: one audit per picklist
+
+A picklist is one snapshot id (MB52, COGI, STO) plus one ScaleX plan fingerprint. Code: [`walk_store.py`](../walk_store.py).
+
+- Nothing is logged until MB52, COGI, and STO are all loaded. Uploading them one at a time shows a preview walk but writes no walk log, no audit rows, and no vault file. When the third dump arrives, exactly one JSON and one CSV are written.
+- If `picklist_walk_run` already holds the snapshot id plus plan fingerprint, the app reuses that walk_run_id and its stored rows and skips the audit. Page refreshes, new sessions, and other clients with the same data write nothing.
+- Sequence and line filters only re-consolidate the stored walk. They never write a file or create a walk_run_id.
+- The audit rows describe the full walk: every PLAN sequence on both lines, whatever is selected on screen.
+- Replacing any of the three dumps, or a real ScaleX plan change, is a new picklist: one new walk_run_id with one new JSON and CSV. Older files stay.
 
 ## Decisions not in the agreed algorithm
 
-- W004 is RM01 only. ver3 fell back to the W004 plant total when RM01 had no row; the walk does not. The existing LX02 fallback inside `extract_detailed_stock_maps` still applies.
+- W004 is RM01 only. The earlier engine fell back to the W004 plant total when RM01 had no row; the walk does not. The existing LX02 fallback inside `extract_detailed_stock_maps` still applies.
 - The line filter restricts the selected sequences to that line before consolidation. The walk itself always covers both lines.
-- `Sequence_Order`, `Starvation_Mins`, and `Priority` come from the earliest selected sequence. `Sequences_Covered` and `Vehicle_SKU` span every selected sequence, as in ver3. Starvation minutes are counted from the first selected sequence on each line.
+- `Sequence_Order`, `Starvation_Mins`, and `Priority` come from the earliest selected sequence. `Sequences_Covered` and `Vehicle_SKU` span every selected sequence, as in the earlier engine. Starvation minutes are counted from the first selected sequence on each line.
 - Fractional BOM quantities are kept in the walk. `BOM Demand` and `Demand to Fulfil` are rounded up for display.
 - Audit codes map to the codes the RCA already reads: Ready and Partial → `ACCEPTED_DEFICIT_FULFILLED`, RED → `REJECTED_W004_STOCKOUT`, trigger 0 → `REJECTED_COVERED_BY_STO` when STO was used, otherwise `REJECTED_SUFFICIENT_M002`.
