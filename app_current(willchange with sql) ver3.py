@@ -10,11 +10,33 @@ import socket
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+import uuid
 
 import numpy as np
 import pandas as pd
 from playwright.sync_api import Page, sync_playwright
 import streamlit as st
+
+from data_sources import (
+    SOURCE_DATABRICKS,
+    SOURCE_OPTIONS,
+    DatabricksSettings,
+    DatabricksSource,
+    DataSourceError,
+    SapUploadSource,
+    frame_fingerprint,
+)
+from picklist_engine import (
+    WALK_COLUMNS,
+    StockBalances,
+    audit_decision,
+    clean_sap_key,
+    consolidate,
+    find_column_by_priority,
+    order_plan_sequences,
+    run_walk,
+    select_rows,
+)
 
 # ---------------------------------------------------------
 # PAGE CONFIGURATION
@@ -170,6 +192,54 @@ def init_db():
                 raw_json TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS picklist_walk_run (
+                walk_run_id TEXT PRIMARY KEY,
+                snapshot_id TEXT,
+                batch_fingerprint TEXT,
+                source TEXT,
+                timestamp DATETIME,
+                client_ip TEXT,
+                sequence_count INTEGER,
+                material_count INTEGER,
+                total_trigger REAL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS picklist_walk (
+                walk_run_id TEXT,
+                walk_order INTEGER,
+                line TEXT,
+                sequence_no INTEGER,
+                seq_key TEXT,
+                sku TEXT,
+                batch_count INTEGER,
+                minute_offset INTEGER,
+                part_id TEXT,
+                part_key TEXT,
+                description TEXT,
+                need REAL,
+                plant_taken REAL,
+                sto_taken REAL,
+                w004_taken REAL,
+                trigger REAL,
+                shortfall REAL,
+                status TEXT,
+                plant_after REAL,
+                sto_after REAL,
+                w004_after REAL,
+                pss_qty INTEGER,
+                pss_type TEXT,
+                m002_stock REAL,
+                cogi_qty REAL,
+                plant_opening REAL,
+                sto_opening REAL,
+                w004_opening REAL,
+                open_po_numbers TEXT,
+                snapshot_id TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_picklist_walk_run ON picklist_walk (walk_run_id)")
 
 init_db()
 
@@ -805,10 +875,6 @@ OFFICIAL_PSS_MASTER = {
     "BD0503B003ANNA": (720, "Pallet")
 }
 
-def clean_sap_key(val: Any) -> str:
-    s = re.sub(r'[^A-Za-z0-9]', '', str(val)).upper()
-    return s.lstrip("0")
-
 def get_official_pss(part_id: str, desc: str = "") -> Tuple[int, str]:
     pid_raw = str(part_id).strip().upper()
     pid_clean = clean_sap_key(pid_raw)
@@ -827,15 +893,6 @@ def get_official_pss(part_id: str, desc: str = "") -> Tuple[int, str]:
         return 32, "Trolley"
     
     return 60, "FLC"
-
-def find_column_by_priority(df: pd.DataFrame, candidates: List[str], exclude: List[str] = None) -> Optional[str]:
-    exclude = exclude or []
-    for cand in candidates:
-        for col in df.columns:
-            c_clean = str(col).strip().lower()
-            if cand in c_clean and not any(ex in c_clean for ex in exclude):
-                return col
-    return None
 
 # ---------------------------------------------------------
 # 2. BULLETPROOF LX02 PROCESSOR
@@ -1476,6 +1533,26 @@ def record_audit_run(run_id: str, audit_records: List[dict]):
     # Flush WAL memory buffer straight into disk file
     flush_db_to_disk()
 
+def record_walk_run(walk_run_id: str, walk_df: pd.DataFrame, header: dict):
+    """One walk = one header row plus every walk row, triggered or not."""
+    rows = walk_df[WALK_COLUMNS].copy()
+    rows.insert(0, "walk_run_id", walk_run_id)
+    with get_db_connection() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO picklist_walk_run
+            (walk_run_id, snapshot_id, batch_fingerprint, source, timestamp, client_ip,
+             sequence_count, material_count, total_trigger)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            walk_run_id, header["snapshot_id"], header["batch_fingerprint"], header["source"],
+            header["timestamp"], header["client_ip"], int(header["sequence_count"]),
+            int(header["material_count"]), float(header["total_trigger"]),
+        ))
+        if not rows.empty:
+            rows.to_sql("picklist_walk", conn, if_exists="append", index=False)
+        conn.commit()
+    flush_db_to_disk()
+
 def extract_detailed_stock_maps(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame = None):
     if mb52_df.empty and (lx02_df is None or lx02_df.empty):
         return {}, {}, {}, {}, {}
@@ -1873,6 +1950,21 @@ if st.sidebar.button("🧹 Clear SAP Cache"):
 st.sidebar.divider()
 st.sidebar.subheader("📂 Upload SAP Dumps")
 
+def read_databricks_secrets() -> dict:
+    try:
+        return dict(st.secrets.get("databricks", {}))
+    except Exception:
+        return {}
+
+stock_source_choice = st.sidebar.selectbox("SAP Stock Source:", SOURCE_OPTIONS, index=0)
+databricks_settings = DatabricksSettings.resolve(read_databricks_secrets())
+if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is None:
+    st.sidebar.warning(
+        "⚠️ Databricks not configured (missing "
+        + ", ".join(DatabricksSettings.missing(read_databricks_secrets()))
+        + "). Using SAP uploads."
+    )
+
 uploaded_mb52 = st.sidebar.file_uploader("Upload MB52 Stock", type=["csv", "xlsx", "xls"], key="uploader_mb52_stock")
 if uploaded_mb52 is not None:
     loaded_mb = load_uploaded_file(uploaded_mb52)
@@ -1991,14 +2083,12 @@ if "advance_line" in query_params:
 
 def apply_band2_row_styles(row):
     status_str = str(row.get("Transfer Status", row.get("Status", "")))
-    w004_stk = row.get("W004 Stock", row.get("W004", 0))
-    need_qty = row.get("Need to be Picked", row.get("Transfer", 0))
 
-    if "Out of Stock" in status_str or w004_stk == 0:
+    if "Out of Stock" in status_str:
         return ["background-color: #fee2e2; color: #991b1b; font-weight: bold;"] * len(row)
-    elif "Partial" in status_str or (0 < w004_stk < need_qty):
+    elif "Partial" in status_str:
         return ["background-color: #fef9c3; color: #854d0e; font-weight: bold;"] * len(row)
-    elif "Ready" in status_str or w004_stk >= need_qty:
+    elif "Ready" in status_str:
         return ["background-color: #dcfce7; color: #166534; font-weight: bold;"] * len(row)
     return ["background-color: #ffffff; color: #0f172a;"] * len(row)
 
@@ -2179,29 +2269,100 @@ active_seq_keys, cutoff_seq_keys = resolve_dispatch_sequences(
 # ---------------------------------------------------------
 # COMPUTE CORE REPLENISHMENT MATH (CACHED)
 # ---------------------------------------------------------
-mb52_in = st.session_state.get("mb52_df", pd.DataFrame())
-cogi_in = st.session_state.get("cogi_df", pd.DataFrame())
-sto_in = st.session_state.get("sto_df", pd.DataFrame())
+def compute_sequence_walk(
+    batches: pd.DataFrame,
+    bom_df: pd.DataFrame,
+    mb52_df: pd.DataFrame,
+    cogi_df: pd.DataFrame,
+    sto_df: pd.DataFrame,
+    lx02_df: pd.DataFrame,
+    snapshot_id: str,
+) -> pd.DataFrame:
+    m002_rm01_map, m002_ps01_map, _, w004_rm01_map, _ = extract_detailed_stock_maps(mb52_df, lx02_df)
+    sto_qty_map, sto_po_map = process_open_sto(sto_df)
+    balances = StockBalances.from_maps(
+        m002_rm01_map, m002_ps01_map, process_cogi_dump(cogi_df), sto_qty_map, w004_rm01_map, sto_po_map
+    )
+    return run_walk(
+        batches, bom_df, balances,
+        handled_units=set(OFFICIAL_PSS_MASTER),
+        pss_lookup=get_official_pss,
+        snapshot_id=snapshot_id,
+        descriptions=build_description_map(mb52_df, lx02_df, bom_df),
+    )
 
-filter_signature = f"{line_filter}_{status_filter}_{pss_filter}_{sorted(list(active_seq_keys))}_{calc_mode}_{len(batches_df)}_{len(mb52_in)}"
+lx02_in = st.session_state.get("lx02_df", pd.DataFrame())
+upload_source = SapUploadSource(
+    st.session_state.get("mb52_df", pd.DataFrame()),
+    st.session_state.get("cogi_df", pd.DataFrame()),
+    st.session_state.get("sto_df", pd.DataFrame()),
+    lx02_in,
+)
+stock_source = upload_source
+if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is not None:
+    stock_source = DatabricksSource(databricks_settings)
+try:
+    sap_snapshot = stock_source.load()
+except DataSourceError as exc:
+    st.sidebar.error(f"❌ {exc} Using SAP uploads.")
+    sap_snapshot = upload_source.load()
 
-need_recompute = (
-    "cached_master_df" not in st.session_state or
-    st.session_state.get("last_calc_signature") != filter_signature or
+mb52_in, cogi_in, sto_in = sap_snapshot.mb52, sap_snapshot.cogi, sap_snapshot.sto
+
+bom_for_walk = get_master_bom_df()
+plan_sequences = order_plan_sequences(batches_df)
+batch_fingerprint = (
+    frame_fingerprint(plan_sequences[["Line", "ScaleX_Sequence_No", "SKUName", "Count"]])
+    + f"_bom{len(bom_for_walk)}"
+)
+walk_key = f"{sap_snapshot.snapshot_id}|{batch_fingerprint}"
+
+new_walk = (
+    "walk_df" not in st.session_state or
+    st.session_state.get("walk_key") != walk_key or
     st.session_state.pop("force_recalculate", False)
 )
 
-if need_recompute:
-    master_df = calculate_band2_and_pss_engine(
-        batches_df, mb52_in, cogi_in, sto_in, line_filter, hide_hold, active_seq_keys, calc_mode
+if new_walk:
+    if bom_for_walk.empty:
+        st.error("🚨 BOM file not found. Upload it in the sidebar.")
+    walk_df = compute_sequence_walk(
+        batches_df, bom_for_walk, mb52_in, cogi_in, sto_in, lx02_in, sap_snapshot.snapshot_id
     )
-    st.session_state["cached_master_df"] = master_df
-    st.session_state["last_calc_signature"] = filter_signature
+    walk_run_id = f"walk_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    record_walk_run(walk_run_id, walk_df, {
+        "snapshot_id": sap_snapshot.snapshot_id,
+        "batch_fingerprint": batch_fingerprint,
+        "source": sap_snapshot.source,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "client_ip": get_client_ip(),
+        "sequence_count": plan_sequences["seq_key"].nunique(),
+        "material_count": walk_df["part_key"].nunique() if not walk_df.empty else 0,
+        "total_trigger": walk_df["trigger"].sum() if not walk_df.empty else 0.0,
+    })
+    st.session_state["walk_df"] = walk_df
+    st.session_state["walk_key"] = walk_key
+    st.session_state["walk_run_id"] = walk_run_id
 
+walk_df = st.session_state["walk_df"]
+walk_run_id = st.session_state["walk_run_id"]
+
+line_walk_df = walk_df if line_filter == "All" else walk_df[walk_df["line"].str.lower() == line_filter.lower()]
+selected_seq_keys = active_seq_keys if active_seq_keys else None
+master_df = consolidate(line_walk_df, selected_seq_keys)
+st.session_state["cached_master_df"] = master_df
+if not walk_df.empty and master_df.empty:
+    st.warning("⚠️ No batches selected in the dispatch horizon.")
+
+if new_walk:
     # -------------------------------------------------------------
     # 🚀 WRITE ALL PARTS (INCLUDED & CUTOFF) TO SQLITE DATABASE
     # -------------------------------------------------------------
-    run_id = f"run_{time.strftime('%Y%m%d_%H%M%S')}_{get_client_ip().replace('.', '_')}"
+    run_id = walk_run_id
+    sto_taken_by_part = (
+        select_rows(line_walk_df, selected_seq_keys).groupby("part_key")["sto_taken"].sum().to_dict()
+        if not line_walk_df.empty else {}
+    )
     m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = extract_detailed_stock_maps(mb52_in)
     sto_q_map, sto_po_map = process_open_sto(sto_in)
 
@@ -2229,16 +2390,8 @@ if need_recompute:
             w_rm01 = w004_rm01_map.get(clean_pid, 0.0)
             sto_val = sto_q_map.get(clean_pid, 0.0)
 
-            status, code, reason, d_fulfil = classify_material_decision(
-                demand=float(r["BOM Demand"]),
-                m002_avail=float(m_rm01 + m_ps01 - r.get("COGI Qty", 0)),
-                w004_stock=float(w_rm01),
-                open_sto=float(sto_val),
-                truck_scanned=0.0,
-                pv01_stock=float(m_pv01),
-                is_hold_batch=False,
-                unit_usage=1.0,
-                safety_buffer_mins=30
+            status, code, reason = audit_decision(
+                str(r["Transfer Status"]), float(sto_taken_by_part.get(clean_pid, 0.0))
             )
 
             record_item = {
@@ -2276,7 +2429,7 @@ if need_recompute:
                 "picklist_status": status,
                 "decision_code": code,
                 "decision_reason": reason,
-                "demand_to_fulfil": float(d_fulfil),
+                "demand_to_fulfil": float(r["Demand to Fulfil"]),
                 "need_to_be_picked": float(r["Need to be Picked"]),
                 "pss_boxes_to_pick": int(r["To be picked PSS count"]),
                 "starvation_minutes": int(r["Starvation_Mins"]),
@@ -2343,8 +2496,6 @@ if need_recompute:
 
     # Commit all parts to SQLite
     record_audit_run(run_id, audit_batch)
-else:
-    master_df = st.session_state.get("cached_master_df", pd.DataFrame())
 
 
 # ---------------------------------------------------------
