@@ -33,7 +33,12 @@ WALK_COLUMNS = [
     "pss_qty", "pss_type",
     "m002_stock", "cogi_qty", "plant_opening", "sto_opening", "w004_opening", "open_po_numbers",
     "snapshot_id",
+] + [
+    # Opening amounts per part, stored for audit only; the walk spends plant, sto, w004 above.
+    "m002_rm01", "m002_ps01", "m002_pv01", "w004_rm01", "sto", "cogi",
 ]
+
+OPENING_STOCK_COLUMNS = WALK_COLUMNS[-6:]
 
 MASTER_COLUMNS = [
     "Sequence_Order", "Vehicle_SKU", "Part ID", "Part Name", "BOM Demand", "Demand to Fulfil",
@@ -91,6 +96,9 @@ class StockBalances:
     m002_stock: Dict[str, float] = field(default_factory=dict)
     cogi: Dict[str, float] = field(default_factory=dict)
     open_pos: Dict[str, str] = field(default_factory=dict)
+    m002_rm01: Dict[str, float] = field(default_factory=dict)
+    m002_ps01: Dict[str, float] = field(default_factory=dict)
+    m002_pv01: Dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_maps(
@@ -101,7 +109,9 @@ class StockBalances:
         sto: Dict[str, float],
         w004_rm01: Dict[str, float],
         open_pos: Optional[Dict[str, str]] = None,
+        m002_pv01: Optional[Dict[str, float]] = None,
     ) -> "StockBalances":
+        """plant = max(0, RM01 + PS01 - COGI). PV01 is stored but never spent."""
         keys = set(m002_rm01) | set(m002_ps01) | set(cogi)
         m002 = {k: float(m002_rm01.get(k, 0.0)) + float(m002_ps01.get(k, 0.0)) for k in keys}
         plant = {k: max(0.0, m002[k] - float(cogi.get(k, 0.0))) for k in keys}
@@ -112,6 +122,9 @@ class StockBalances:
             m002_stock=m002,
             cogi={k: float(v) for k, v in cogi.items()},
             open_pos=dict(open_pos or {}),
+            m002_rm01={k: float(v) for k, v in m002_rm01.items()},
+            m002_ps01={k: float(v) for k, v in m002_ps01.items()},
+            m002_pv01={k: float(v) for k, v in (m002_pv01 or {}).items()},
         )
 
 
@@ -250,6 +263,12 @@ def walk_sequences(
                 "sto_opening": balances.sto.get(key, 0.0),
                 "w004_opening": balances.w004.get(key, 0.0),
                 "open_po_numbers": balances.open_pos.get(key, ""),
+                "m002_rm01": balances.m002_rm01.get(key, 0.0),
+                "m002_ps01": balances.m002_ps01.get(key, 0.0),
+                "m002_pv01": balances.m002_pv01.get(key, 0.0),
+                "w004_rm01": balances.w004.get(key, 0.0),
+                "sto": balances.sto.get(key, 0.0),
+                "cogi": balances.cogi.get(key, 0.0),
             }
         bal = remaining[key]
         rest = r.need
@@ -298,6 +317,7 @@ def walk_sequences(
             "w004_opening": info["w004_opening"],
             "open_po_numbers": info["open_po_numbers"],
             "snapshot_id": snapshot_id,
+            **{col: info[col] for col in OPENING_STOCK_COLUMNS},
         })
     return pd.DataFrame(out, columns=WALK_COLUMNS)
 

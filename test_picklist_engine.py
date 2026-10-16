@@ -96,6 +96,22 @@ def test_sto_is_used_before_w004():
     assert rows["status"].tolist() == [COVERED, TRIGGERED]
 
 
+def test_opening_stock_columns_are_distinct_and_walk_uses_combined_plant():
+    stock = StockBalances.from_maps(
+        m002_rm01={PART: 11}, m002_ps01={PART: 7}, cogi={PART: 3}, sto={PART: 5},
+        w004_rm01={PART: 100}, m002_pv01={PART: 13},
+    )
+    rows = walk_sequences(demand_frame([30, 30]), stock, fixed_pss(), "snap-1")
+    expected = {"m002_rm01": 11, "m002_ps01": 7, "m002_pv01": 13, "w004_rm01": 100, "sto": 5, "cogi": 3}
+    for _, row in rows.iterrows():
+        assert {k: row[k] for k in expected} == expected
+    first, second = rows.iloc[0], rows.iloc[1]
+    assert first["plant_opening"] == 15
+    assert (first["plant_taken"], first["sto_taken"], first["trigger"]) == (15, 5, 10)
+    assert (second["plant_taken"], second["sto_taken"], second["trigger"]) == (0, 0, 30)
+    assert first["w004_taken"] == first["trigger"]
+
+
 def test_yellow_mid_sequence():
     rows = walk([30, 30, 30], w004=40)
     assert rows["trigger"].tolist() == [30, 10, 0]

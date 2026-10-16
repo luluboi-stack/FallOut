@@ -2222,10 +2222,11 @@ def compute_sequence_walk(
     lx02_df: pd.DataFrame,
     snapshot_id: str,
 ) -> pd.DataFrame:
-    m002_rm01_map, m002_ps01_map, _, w004_rm01_map, _ = extract_detailed_stock_maps(mb52_df, lx02_df)
+    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, _ = extract_detailed_stock_maps(mb52_df, lx02_df)
     sto_qty_map, sto_po_map = process_open_sto(sto_df)
     balances = StockBalances.from_maps(
-        m002_rm01_map, m002_ps01_map, process_cogi_dump(cogi_df), sto_qty_map, w004_rm01_map, sto_po_map
+        m002_rm01_map, m002_ps01_map, process_cogi_dump(cogi_df), sto_qty_map, w004_rm01_map, sto_po_map,
+        m002_pv01=m002_pv01_map,
     )
     return run_walk(
         batches, bom_df, balances,

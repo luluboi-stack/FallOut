@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
-from picklist_engine import WALK_COLUMNS
+from picklist_engine import OPENING_STOCK_COLUMNS, WALK_COLUMNS
 
 WALK_PREVIEW = "preview"
 WALK_REUSE = "reuse"
@@ -63,9 +63,19 @@ def init_walk_tables(conn: sqlite3.Connection):
             sto_opening REAL,
             w004_opening REAL,
             open_po_numbers TEXT,
-            snapshot_id TEXT
+            snapshot_id TEXT,
+            m002_rm01 REAL,
+            m002_ps01 REAL,
+            m002_pv01 REAL,
+            w004_rm01 REAL,
+            sto REAL,
+            cogi REAL
         )
     """)
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(picklist_walk)")}
+    for col in OPENING_STOCK_COLUMNS:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE picklist_walk ADD COLUMN {col} REAL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_picklist_walk_run ON picklist_walk (walk_run_id)")
     try:
         conn.execute(

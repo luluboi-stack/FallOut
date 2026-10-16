@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from data_sources import SapUploadSource
-from picklist_engine import StockBalances, walk_sequences
+from picklist_engine import OPENING_STOCK_COLUMNS, StockBalances, walk_sequences
 from walk_store import (
     WALK_NEW,
     WALK_PREVIEW,
@@ -88,6 +88,25 @@ def test_replaced_dump_or_plan_change_is_a_new_picklist(conn):
     assert claim_walk_run(conn, "walk_2", sample_walk(), header(fingerprint="plan2")) == ("walk_2", True)
     ids = [r[0] for r in conn.execute("SELECT walk_run_id FROM picklist_walk_run ORDER BY walk_run_id")]
     assert ids == ["walk_1", "walk_2"]
+
+
+def test_old_picklist_walk_table_gets_opening_stock_columns(tmp_path):
+    c = sqlite3.connect(tmp_path / "old.db")
+    c.execute("CREATE TABLE picklist_walk (walk_run_id TEXT, part_key TEXT, trigger REAL)")
+    c.execute("INSERT INTO picklist_walk VALUES ('old_run', 'A', 5)")
+    init_walk_tables(c)
+    cols = {row[1] for row in c.execute("PRAGMA table_info(picklist_walk)")}
+    assert set(OPENING_STOCK_COLUMNS) <= cols
+    assert c.execute("SELECT trigger, m002_pv01 FROM picklist_walk").fetchone() == (5.0, None)
+    init_walk_tables(c)
+    c.close()
+
+
+def test_opening_stock_columns_round_trip(conn):
+    walk = sample_walk()
+    claim_walk_run(conn, "walk_1", walk, header())
+    loaded = load_walk_rows(conn, "walk_1")
+    assert loaded[OPENING_STOCK_COLUMNS].values.tolist() == walk[OPENING_STOCK_COLUMNS].values.tolist()
 
 
 def test_reused_walk_rows_round_trip(conn):

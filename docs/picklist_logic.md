@@ -18,6 +18,8 @@ One walk runs right after each SAP pull (MB52, COGI, STO) or ScaleX plan change.
    - RED: need still unmet and w004 was already 0, trigger 0
 5. One row per sequence per material is stored in `picklist_walk`, with and without a trigger.
 
+Each `picklist_walk` row also carries the part's opening amounts for that walk: `m002_rm01`, `m002_ps01`, `m002_pv01`, `w004_rm01`, `sto`, and `cogi`. They are the same on every sequence row of the part. They are stored for audit only and do not change the subtraction order: the walk still spends one plant bucket max(0, RM01 + PS01 − COGI), then STO, then W004 RM01. PV01 is never spent.
+
 Not in the walk: the 30-piece buffer, `preceding_drain`, `classify_material_decision`, the Experimental Additive mode, and any time-based cutoff.
 
 ## Frontend consolidation (`consolidate`)
