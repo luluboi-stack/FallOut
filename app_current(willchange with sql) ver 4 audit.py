@@ -26,7 +26,7 @@ from data_sources import (
     SapUploadSource,
     frame_fingerprint,
 )
-from drive_export import DRIVE_NOT_CONFIGURED, DriveResult, drive_settings_missing, export_run_json
+from picklist_drive import PICKLIST_SKIPPED, PicklistCopyResult, append_run_json
 from picklist_engine import (
     StockBalances,
     audit_decision,
@@ -1471,7 +1471,7 @@ AUDIT_VAULT_DIR = os.path.join(BASE_DIR, "audit_vault")
 os.makedirs(os.path.join(AUDIT_VAULT_DIR, "runs_csv"), exist_ok=True)
 os.makedirs(os.path.join(AUDIT_VAULT_DIR, "runs_json"), exist_ok=True)
 
-def record_audit_run(run_id: str, audit_records: List[dict]) -> Optional[DriveResult]:
+def record_audit_run(run_id: str, audit_records: List[dict]) -> Optional[PicklistCopyResult]:
     if not audit_records:
         return None
 
@@ -1494,8 +1494,10 @@ def record_audit_run(run_id: str, audit_records: List[dict]) -> Optional[DriveRe
     # Flush WAL memory buffer straight into disk file
     flush_db_to_disk()
 
-    # 4. Replace the shared Drive picklist.csv with this run's JSON
-    return export_run_json(json_path, AUDIT_VAULT_DIR)
+    # 4. Append this JSON into the Drive desktop folder. drive_export.export_run_json
+    # stays in the repo but is not called: it would replace picklist.csv through the
+    # Drive API and upload the same file a second time. Filter changes never reach here.
+    return append_run_json(json_path)
 
 def extract_detailed_stock_maps(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame = None):
     if mb52_df.empty and (lx02_df is None or lx02_df.empty):
@@ -2463,14 +2465,10 @@ if write_audit:
 
 drive_result = st.session_state.get("drive_result")
 if drive_result is None:
-    drive_missing = drive_settings_missing()
-    if drive_missing:
-        st.sidebar.caption(f"☁️ Drive not configured (missing {', '.join(drive_missing)}).")
-    else:
-        st.sidebar.caption("☁️ Drive picklist.csv updates on the next new picklist.")
+    st.sidebar.caption("☁️ Picklist folder updates on the next new walk.")
 elif drive_result.ok:
     st.sidebar.success(f"☁️ {drive_result.message}")
-elif drive_result.status == DRIVE_NOT_CONFIGURED:
+elif drive_result.status == PICKLIST_SKIPPED:
     st.sidebar.caption(f"☁️ {drive_result.message}")
 else:
     st.sidebar.error(f"☁️ {drive_result.message}")
