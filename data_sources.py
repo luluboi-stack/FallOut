@@ -25,10 +25,19 @@ SOURCE_OPTIONS = [SOURCE_SAP_UPLOAD, SOURCE_DATABRICKS]
 
 CATALOG = "sap.sapabap1"
 
+DEFAULT_DATABRICKS_HOST = "8259552823336828.8.gcp.databricks.com"
+DEFAULT_DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/823716c4-00e1-47a9-b328-5fa943653443"
+
 DATABRICKS_SETTINGS = {
     "host": "DATABRICKS_HOST",
     "http_path": "DATABRICKS_HTTP_PATH",
     "token": "DATABRICKS_TOKEN",
+}
+
+DATABRICKS_CONNECTION_DEFAULTS = {
+    "host": DEFAULT_DATABRICKS_HOST,
+    "http_path": DEFAULT_DATABRICKS_HTTP_PATH,
+    "token": "",
 }
 
 DATABRICKS_TABLE_DEFAULTS = {
@@ -153,16 +162,22 @@ class DatabricksSettings:
         cls,
         secrets: Optional[Mapping[str, Any]] = None,
         environ: Optional[Mapping[str, str]] = None,
-    ) -> Optional["DatabricksSettings"]:
-        """Connection values are required. Table names fall back to sap.sapabap1."""
+    ) -> "DatabricksSettings":
+        """Host and HTTP path default to the asia-south1 warehouse. A token is optional.
+
+        An empty token means browser SSO. Table names fall back to sap.sapabap1.
+        """
         environ = os.environ if environ is None else environ
         secrets = secrets or {}
         values = {}
         for field_name, env_name in DATABRICKS_SETTINGS.items():
-            val = secrets.get(field_name) or environ.get(env_name) or ""
-            values[field_name] = str(val).strip()
-        if not all(values.values()):
-            return None
+            raw = secrets.get(field_name)
+            if raw is None or str(raw).strip() == "":
+                raw = environ.get(env_name)
+            if raw is None or str(raw).strip() == "":
+                raw = DATABRICKS_CONNECTION_DEFAULTS[field_name]
+            values[field_name] = str(raw).strip()
+        values["host"] = _databricks_hostname(values["host"])
         for field_name, env_name in DATABRICKS_TABLE_ENV.items():
             override = secrets.get(field_name) or environ.get(env_name) or ""
             values[field_name] = str(override).strip() or DATABRICKS_TABLE_DEFAULTS[field_name]
@@ -170,12 +185,27 @@ class DatabricksSettings:
 
     @staticmethod
     def missing(secrets: Optional[Mapping[str, Any]] = None, environ: Optional[Mapping[str, str]] = None):
-        environ = os.environ if environ is None else environ
-        secrets = secrets or {}
-        return [
-            env_name for field_name, env_name in DATABRICKS_SETTINGS.items()
-            if not (secrets.get(field_name) or environ.get(env_name))
-        ]
+        """Nothing is required. Host and HTTP path have defaults, and SSO covers a missing token."""
+        return []
+
+
+def _databricks_hostname(value: str) -> str:
+    host = str(value).strip()
+    host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE)
+    return host.strip("/")
+
+
+def databricks_connect_kwargs(settings: DatabricksSettings) -> dict:
+    """PAT when a token is set. Otherwise user-to-machine OAuth, which opens a browser once."""
+    kwargs = {
+        "server_hostname": settings.host,
+        "http_path": settings.http_path,
+    }
+    if settings.token:
+        kwargs["access_token"] = settings.token
+    else:
+        kwargs["auth_type"] = "databricks-oauth"
+    return kwargs
 
 
 def quote_table(name: str) -> str:
@@ -602,6 +632,11 @@ class DatabricksSource:
     """MB52, COGI, open STO, and a single-level BOM from sap.sapabap1.
 
     Frames use the column names the app's SAP parsers already find.
+    Host defaults to 8259552823336828.8.gcp.databricks.com and the SQL warehouse
+    in asia-south1. With no DATABRICKS_TOKEN, connect uses auth_type
+    databricks-oauth so the Windows desktop browser signs in once and the
+    connector caches that login. A declined login or a missing browser raises
+    DataSourceError; the app shows it in the sidebar and stays on SAP uploads.
     """
 
     name = SOURCE_DATABRICKS
@@ -614,21 +649,26 @@ class DatabricksSource:
         return self.settings is not None
 
     def load(self) -> SapSnapshot:
-        self._ensure_ready()
-        with self._connect() as conn:
-            return self._load_connected(conn)
+        return self._using(self._load_connected)
 
     def read_bom(self, reference: pd.DataFrame) -> BomLoad:
-        self._ensure_ready()
-        with self._connect() as conn:
-            return self._bom_connected(conn, reference)
+        return self._using(lambda conn: self._bom_connected(conn, reference))
 
     def pull(self, reference: pd.DataFrame) -> tuple[SapSnapshot, BomLoad]:
+        def both(conn):
+            return self._load_connected(conn), self._bom_connected(conn, reference)
+
+        return self._using(both)
+
+    def _using(self, fn):
         self._ensure_ready()
-        with self._connect() as conn:
-            snapshot = self._load_connected(conn)
-            bom = self._bom_connected(conn, reference)
-        return snapshot, bom
+        try:
+            with self._connect() as conn:
+                return fn(conn)
+        except DataSourceError:
+            raise
+        except Exception as exc:
+            raise DataSourceError(str(exc)) from exc
 
     def _ensure_ready(self) -> None:
         if self.settings is None:
@@ -640,12 +680,10 @@ class DatabricksSource:
             raise DataSourceError("databricks-sql-connector is not installed: pip install databricks-sql-connector")
 
     def _connect(self):
-        s = self.settings
-        return databricks_sql.connect(
-            server_hostname=s.host,
-            http_path=s.http_path,
-            access_token=s.token,
-        )
+        try:
+            return databricks_sql.connect(**databricks_connect_kwargs(self.settings))
+        except Exception as exc:
+            raise DataSourceError(str(exc)) from exc
 
     def _load_connected(self, conn) -> SapSnapshot:
         s = self.settings

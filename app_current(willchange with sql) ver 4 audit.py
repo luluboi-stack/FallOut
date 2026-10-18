@@ -1916,12 +1916,8 @@ def read_databricks_secrets() -> dict:
 
 stock_source_choice = st.sidebar.selectbox("SAP Stock Source:", SOURCE_OPTIONS, index=0)
 databricks_settings = DatabricksSettings.resolve(read_databricks_secrets())
-if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is None:
-    st.sidebar.warning(
-        "⚠️ Databricks not configured (missing "
-        + ", ".join(DatabricksSettings.missing(read_databricks_secrets()))
-        + "). Using SAP uploads."
-    )
+if stock_source_choice == SOURCE_DATABRICKS and not databricks_settings.token:
+    st.sidebar.caption("Databricks opens a browser once to sign in. No personal access token is required.")
 
 uploaded_mb52 = st.sidebar.file_uploader("Upload MB52 Stock", type=["csv", "xlsx", "xls"], key="uploader_mb52_stock")
 if uploaded_mb52 is not None:

@@ -91,6 +91,12 @@ A picklist is one snapshot id (MB52, COGI, STO) plus one ScaleX plan fingerprint
 
 When that new `audit_vault/runs_json/<walk_id>.json` is written, the app reads that file (not `runs_csv`) and appends every record, including trigger 0, to `picklist.csv` in the Drive for desktop folder. Every JSON key is a column, including `raw_json`, and `audit_run_id` stays so walks can be told apart. The first write creates the header; later walks append rows only and never replace the file. The same JSON is copied into that folder under the same filename. The folder is `PICKLIST_DRIVE_DIR`, or `G:\My Drive\Picklist` when unset. If the folder is missing, or a write fails, the walk still completes and the sidebar notes the skip. Refreshes and filter changes do not touch the folder. Drive for desktop syncs it; the walk does not call the Google Drive API. `drive_export.py` is unchanged and is not called from the walk, so that API path does not upload `picklist.csv` as well.
 
+## Databricks
+
+Host defaults to `8259552823336828.8.gcp.databricks.com`. HTTP path defaults to `/sql/1.0/warehouses/823716c4-00e1-47a9-b328-5fa943653443` (asia-south1). Override either with `DATABRICKS_HOST` or `DATABRICKS_HTTP_PATH`.
+
+Leave `DATABRICKS_TOKEN` empty. The first Databricks load uses user-to-machine OAuth (`auth_type="databricks-oauth"`), which opens a browser once and caches the login. A token is used only when `DATABRICKS_TOKEN` is set. If the browser does not open or the login is declined, the sidebar shows the error and the walk stays on the SAP uploads.
+
 ## Decisions not in the agreed algorithm
 
 - W004 is RM01 only. The earlier engine fell back to the W004 plant total when RM01 had no row; the walk does not. The existing LX02 fallback inside `extract_detailed_stock_maps` still applies.

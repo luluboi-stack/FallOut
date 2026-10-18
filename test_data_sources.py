@@ -4,6 +4,8 @@ import pytest
 from data_sources import (
     DATABRICKS_SETTINGS,
     DATABRICKS_TABLE_DEFAULTS,
+    DEFAULT_DATABRICKS_HOST,
+    DEFAULT_DATABRICKS_HTTP_PATH,
     BomLoad,
     DatabricksSettings,
     DatabricksSource,
@@ -16,6 +18,7 @@ from data_sources import (
     build_snapshot_sql,
     build_stock_sql,
     build_sto_sql,
+    databricks_connect_kwargs,
     quote_table,
 )
 
@@ -56,11 +59,11 @@ def test_sap_upload_snapshot_id_tracks_content():
     assert a.mb52 is mb52
 
 
-def test_databricks_settings_need_connection_and_default_tables():
-    assert DatabricksSettings.resolve({}, environ={}) is None
-    connection = {env: "x" for env in DATABRICKS_SETTINGS.values()}
-    settings = DatabricksSettings.resolve({}, environ=connection)
-    assert settings is not None
+def test_databricks_settings_default_warehouse_and_optional_token():
+    settings = DatabricksSettings.resolve({}, environ={})
+    assert settings.host == DEFAULT_DATABRICKS_HOST
+    assert settings.http_path == DEFAULT_DATABRICKS_HTTP_PATH
+    assert settings.token == ""
     assert settings.mb52_table == DATABRICKS_TABLE_DEFAULTS["mb52_table"]
     assert settings.cogi_table.endswith("affw_hourly")
     assert settings.ekko_table.endswith("ekko")
@@ -68,10 +71,37 @@ def test_databricks_settings_need_connection_and_default_tables():
     assert settings.eket_table.endswith("eket")
     assert settings.mast_table.endswith("mast")
     assert settings.stpo_table.endswith("stpo")
-    assert DatabricksSettings.missing({"host": "h"}, environ={}) == [
-        "DATABRICKS_HTTP_PATH",
-        "DATABRICKS_TOKEN",
-    ]
+    assert DatabricksSettings.missing({"host": "h"}, environ={}) == []
+    overridden = DatabricksSettings.resolve({}, environ={
+        "DATABRICKS_HOST": "https://other.cloud.databricks.com/",
+        "DATABRICKS_HTTP_PATH": "/sql/1.0/warehouses/abc",
+        "DATABRICKS_TOKEN": "dapi-test",
+    })
+    assert overridden.host == "other.cloud.databricks.com"
+    assert overridden.http_path == "/sql/1.0/warehouses/abc"
+    assert overridden.token == "dapi-test"
+
+
+def test_connect_uses_browser_sso_unless_a_token_is_set():
+    oauth = databricks_connect_kwargs(DatabricksSettings.resolve({}, environ={}))
+    assert oauth["server_hostname"] == DEFAULT_DATABRICKS_HOST
+    assert oauth["http_path"] == DEFAULT_DATABRICKS_HTTP_PATH
+    assert oauth["auth_type"] == "databricks-oauth"
+    assert "access_token" not in oauth
+    pat = databricks_connect_kwargs(DatabricksSettings.resolve({}, environ={"DATABRICKS_TOKEN": "dapi-test"}))
+    assert pat["access_token"] == "dapi-test"
+    assert "auth_type" not in pat
+
+
+def test_declined_browser_login_is_a_data_source_error():
+    source = DatabricksSource(DatabricksSettings.resolve({}, environ={}))
+
+    def declined():
+        raise RuntimeError("browser declined")
+
+    source._connect = declined
+    with pytest.raises(DataSourceError, match="browser declined"):
+        source.pull(pd.DataFrame())
 
 
 def test_databricks_source_without_settings_is_not_configured():
