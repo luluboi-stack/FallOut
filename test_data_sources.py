@@ -20,6 +20,7 @@ from data_sources import (
     build_sto_sql,
     databricks_connect_kwargs,
     quote_table,
+    stock_snapshot_column,
 )
 
 
@@ -122,6 +123,37 @@ def test_stock_sql_splits_plants_and_storage_locations():
     assert "'M002'" in sql and "'W004'" in sql
     assert "'RM01'" in sql and "'PS01'" in sql and "'PV01'" in sql
     assert "`labst`" in sql
+
+
+def test_stock_frame_keeps_the_latest_batch_timestamp_only():
+    columns = ["matnr", "werks", "lgort", "labst", "batch_id", "batch_ts"]
+    sql = build_stock_sql("sap.sapabap1.nsdm_v_mard_hourly", columns)
+    assert (
+        "`batch_ts` = (SELECT MAX(`batch_ts`) FROM `sap`.`sapabap1`.`nsdm_v_mard_hourly`)"
+        in sql
+    )
+    assert "MAX(`batch_id`)" not in sql
+    assert "'M002'" in sql and "'W004'" in sql
+    assert "'RM01'" in sql and "'PS01'" in sql and "'PV01'" in sql
+    assert "`labst`" in sql
+    assert "insme" not in sql.lower() and "speme" not in sql.lower()
+
+    frame = pd.DataFrame({
+        "batch_ts": ["2026-10-18 08:00:00", "2026-10-18 09:00:00"],
+        "batch_id": [1, 2],
+        "Unrestricted": [416399, 100],
+    })
+    stamp = stock_snapshot_column(columns)
+    latest = frame[frame[stamp] == frame[stamp].max()]
+    assert latest["Unrestricted"].sum() == 100
+    assert frame["Unrestricted"].sum() != latest["Unrestricted"].sum()
+
+    id_only = ["matnr", "werks", "lgort", "labst", "batch_id"]
+    id_sql = build_stock_sql("sap.sapabap1.nsdm_v_mard_hourly", id_only)
+    assert (
+        "`batch_id` = (SELECT MAX(`batch_id`) FROM `sap`.`sapabap1`.`nsdm_v_mard_hourly`)"
+        in id_sql
+    )
 
 
 def test_cogi_sql_uses_entry_quantity_at_m002():

@@ -286,11 +286,24 @@ def _on_or_after_today(alias: str, column: str) -> str:
     )"""
 
 
+def stock_snapshot_column(columns: Sequence[str]) -> Optional[str]:
+    """Hourly stock keeps one load: batch_ts, or batch_id when the timestamp is absent."""
+    return find_column(columns, "batch_ts") or find_column(columns, "batch_id")
+
+
 def build_stock_sql(table: str, columns: Sequence[str]) -> str:
     material = _require_column(columns, "matnr", "material")
     plant = _require_column(columns, "werks", "plant")
     sloc = _require_column(columns, "lgort", "storage_location")
     qty = _require_column(columns, "labst", "unrestricted")
+    filters = [
+        f"UPPER({_sql_text(plant)}) IN ('M002', 'W004')",
+        f"UPPER({_sql_text(sloc)}) IN ('RM01', 'PS01', 'PV01')",
+    ]
+    snapshot = stock_snapshot_column(columns)
+    if snapshot:
+        quoted = quote_column(snapshot)
+        filters.append(f"{quoted} = (SELECT MAX({quoted}) FROM {quote_table(table)})")
     return f"""
         SELECT
             {_sql_text(material)} AS `Material`,
@@ -298,8 +311,7 @@ def build_stock_sql(table: str, columns: Sequence[str]) -> str:
             {_sql_text(sloc)} AS `Storage Location`,
             {_sql_number(qty)} AS `Unrestricted`
         FROM {quote_table(table)}
-        WHERE UPPER({_sql_text(plant)}) IN ('M002', 'W004')
-          AND UPPER({_sql_text(sloc)}) IN ('RM01', 'PS01', 'PV01')
+        WHERE {" AND ".join(filters)}
     """
 
 
