@@ -25,6 +25,7 @@ from data_sources import (
     DataSourceError,
     SapUploadSource,
     frame_fingerprint,
+    load_reference_bom,
 )
 from picklist_drive import PICKLIST_SKIPPED, PicklistCopyResult, append_run_json
 from picklist_engine import (
@@ -73,14 +74,14 @@ LOCAL_BOM_PATH = find_local_file(["BOM_FINAL_EXPLODED (15th Oct).parquet"])
 LOCAL_LX02_PATH = find_local_file(["lx02.csv", "LX02.csv", "LX02.CSV", "lx02.xlsx", "LX02.xlsx", "lx02.xls", "LX02.xls", "LMAO - Data.csv"])
 LOCAL_STO_PATH = find_local_file(["sto.csv", "STO.csv", "open_sto.csv", "open_sto.xlsx", "sto.xlsx", "SIT sep 13 pm.xlsx"])
 
-@st.cache_data(show_spinner="⚡ Loading 400K BOM into RAM (takes < 1 sec)...")
-def get_master_bom_df() -> pd.DataFrame:
-    """Loads 400K BOM once into RAM and caches it. Sub-second subsequent loads."""
-    # 1. Check if user manually uploaded a BOM
-    if "uploaded_bom_df" in st.session_state and not st.session_state["uploaded_bom_df"].empty:
-        return st.session_state["uploaded_bom_df"]
+@st.cache_data(show_spinner="⚡ Loading reference BOM...")
+def load_reference_bom_df() -> pd.DataFrame:
+    """CS12 file used to accept or refuse the live mast/stpo BOM."""
+    return load_reference_bom(BASE_DIR)
 
-    # 2. Check local files
+@st.cache_data(show_spinner="⚡ Loading 400K BOM into RAM (takes < 1 sec)...")
+def load_file_bom_df() -> pd.DataFrame:
+    """The exploded file BOM. Used when Databricks is not selected or the live BOM is refused."""
     if not LOCAL_BOM_PATH or not os.path.exists(LOCAL_BOM_PATH):
         return pd.DataFrame()
 
@@ -111,6 +112,17 @@ def get_master_bom_df() -> pd.DataFrame:
     except Exception:
         pass
     return df
+
+def get_master_bom_df() -> pd.DataFrame:
+    """Upload wins. A checked live BOM is next, and only while Databricks is the source."""
+    uploaded = st.session_state.get("uploaded_bom_df")
+    if isinstance(uploaded, pd.DataFrame) and not uploaded.empty:
+        return uploaded
+    if stock_source_choice == SOURCE_DATABRICKS and st.session_state.get("live_bom_accepted"):
+        live = st.session_state.get("live_bom_frame")
+        if isinstance(live, pd.DataFrame) and not live.empty:
+            return live
+    return load_file_bom_df()
 
 # ---------------------------------------------------------
 # LOCAL DATABASE INITIALIZATION (REFRESH-SAFE & CONCURRENCY-SAFE)
@@ -2246,21 +2258,35 @@ upload_source = SapUploadSource(
     lx02_in,
 )
 stock_source = upload_source
+st.session_state["live_bom_accepted"] = False
 if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is not None:
     stock_source = DatabricksSource(databricks_settings)
 try:
-    sap_snapshot = stock_source.load()
+    if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is not None:
+        sap_snapshot, bom_load = stock_source.pull(load_reference_bom_df())
+        if bom_load.accepted:
+            st.session_state["live_bom_frame"] = bom_load.frame
+            st.session_state["live_bom_accepted"] = True
+            st.sidebar.success(f"✅ Live BOM: **{len(bom_load.frame)} rows**. {bom_load.reason}")
+        else:
+            st.session_state.pop("live_bom_frame", None)
+            st.sidebar.warning(f"⚠️ {bom_load.reason}")
+    else:
+        sap_snapshot = stock_source.load()
 except DataSourceError as exc:
     st.sidebar.error(f"❌ {exc} Using SAP uploads.")
+    st.session_state["live_bom_accepted"] = False
+    st.session_state.pop("live_bom_frame", None)
     sap_snapshot = upload_source.load()
 
 mb52_in, cogi_in, sto_in = sap_snapshot.mb52, sap_snapshot.cogi, sap_snapshot.sto
 
 bom_for_walk = get_master_bom_df()
 plan_sequences = order_plan_sequences(batches_df)
+bom_token = "empty" if bom_for_walk.empty else frame_fingerprint(bom_for_walk)
 batch_fingerprint = (
     frame_fingerprint(plan_sequences[["Line", "ScaleX_Sequence_No", "SKUName", "Count"]])
-    + f"_bom{len(bom_for_walk)}"
+    + f"_bom{bom_token}"
 )
 walk_key = f"{sap_snapshot.snapshot_id}|{batch_fingerprint}"
 
