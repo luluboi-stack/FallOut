@@ -18,8 +18,10 @@ from data_sources import (
     build_snapshot_sql,
     build_stock_sql,
     build_sto_sql,
+    databricks_cache_key,
     databricks_connect_kwargs,
     quote_table,
+    should_refresh_databricks,
     stock_snapshot_column,
 )
 
@@ -92,6 +94,16 @@ def test_connect_uses_browser_sso_unless_a_token_is_set():
     pat = databricks_connect_kwargs(DatabricksSettings.resolve({}, environ={"DATABRICKS_TOKEN": "dapi-test"}))
     assert pat["access_token"] == "dapi-test"
     assert "auth_type" not in pat
+
+
+def test_databricks_refresh_skips_a_recent_pull():
+    key = databricks_cache_key("host", "/sql/1.0/warehouses/abc")
+    assert should_refresh_databricks(None, None, 1_000, key, False)
+    assert should_refresh_databricks(key, 1_000, 1_000 + 30 * 60, key, False) is False
+    assert should_refresh_databricks(key, 1_000, 1_000 + 60 * 60, key, False) is False
+    assert should_refresh_databricks(key, 1_000, 1_000 + 60 * 60 + 1, key, False)
+    assert should_refresh_databricks(key, 1_000, 1_000 + 60, key, True)
+    assert should_refresh_databricks("other|path", 1_000, 1_100, key, False)
 
 
 def test_declined_browser_login_is_a_data_source_error():

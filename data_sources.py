@@ -195,6 +195,29 @@ def _databricks_hostname(value: str) -> str:
     return host.strip("/")
 
 
+DATABRICKS_REFRESH_SECONDS = 60 * 60
+
+
+def databricks_cache_key(host: str, http_path: str) -> str:
+    return f"{host}|{http_path}"
+
+
+def should_refresh_databricks(
+    cached_key: Optional[str],
+    cached_at: Optional[float],
+    now: float,
+    cache_key: str,
+    force: bool,
+    max_age_seconds: float = DATABRICKS_REFRESH_SECONDS,
+) -> bool:
+    """True when the cache is empty, the warehouse changed, the user forced a sync, or the pull is older than 60 minutes."""
+    if force:
+        return True
+    if not cached_key or cached_key != cache_key or cached_at is None:
+        return True
+    return (now - float(cached_at)) > max_age_seconds
+
+
 def databricks_connect_kwargs(settings: DatabricksSettings) -> dict:
     """PAT when a token is set. Otherwise user-to-machine OAuth, which opens a browser once."""
     kwargs = {

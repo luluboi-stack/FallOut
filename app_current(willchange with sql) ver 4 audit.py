@@ -24,8 +24,10 @@ from data_sources import (
     DatabricksSource,
     DataSourceError,
     SapUploadSource,
+    databricks_cache_key,
     frame_fingerprint,
     load_reference_bom,
+    should_refresh_databricks,
 )
 from picklist_drive import PICKLIST_SKIPPED, PicklistCopyResult, append_run_json
 from picklist_engine import (
@@ -1886,6 +1888,7 @@ if auto_sync_enabled and time_elapsed >= 600:
         st.toast("🔄 ScaleX Plan synced in background!", icon="ℹ️")
 
 if st.sidebar.button("🔄 Sync Live ScaleX Plan (Now)", type="primary"):
+    st.session_state["databricks_force_refresh"] = True
     with st.spinner("Connecting to ScaleX Portal at 192.168.201.248..."):
         st.session_state["last_sync_timestamp"] = time.time()
         batches_result = fetch_all_scalex_data()
@@ -2253,27 +2256,54 @@ upload_source = SapUploadSource(
     st.session_state.get("sto_df", pd.DataFrame()),
     lx02_in,
 )
-stock_source = upload_source
 st.session_state["live_bom_accepted"] = False
+bom_load = None
+announce_bom = False
 if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is not None:
     stock_source = DatabricksSource(databricks_settings)
-try:
-    if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is not None:
-        sap_snapshot, bom_load = stock_source.pull(load_reference_bom_df())
-        if bom_load.accepted:
-            st.session_state["live_bom_frame"] = bom_load.frame
-            st.session_state["live_bom_accepted"] = True
-            st.sidebar.success(f"✅ Live BOM: **{len(bom_load.frame)} rows**. {bom_load.reason}")
-        else:
-            st.session_state.pop("live_bom_frame", None)
-            st.sidebar.warning(f"⚠️ {bom_load.reason}")
+    cache_key = databricks_cache_key(databricks_settings.host, databricks_settings.http_path)
+    cache = st.session_state.get("databricks_pull_cache")
+    force_databricks = bool(st.session_state.pop("databricks_force_refresh", False))
+    cached_key = cache.get("key") if isinstance(cache, dict) else None
+    cached_at = cache.get("pulled_at") if isinstance(cache, dict) else None
+    refresh_databricks = should_refresh_databricks(
+        cached_key, cached_at, time.time(), cache_key, force_databricks
+    )
+    if not refresh_databricks:
+        sap_snapshot = cache["snapshot"]
+        bom_load = cache["bom"]
     else:
-        sap_snapshot = stock_source.load()
-except DataSourceError as exc:
-    st.sidebar.error(f"❌ {exc} Using SAP uploads.")
-    st.session_state["live_bom_accepted"] = False
-    st.session_state.pop("live_bom_frame", None)
+        try:
+            sap_snapshot, bom_load = stock_source.pull(load_reference_bom_df())
+            st.session_state["databricks_pull_cache"] = {
+                "key": cache_key,
+                "pulled_at": time.time(),
+                "snapshot": sap_snapshot,
+                "bom": bom_load,
+            }
+            announce_bom = True
+        except DataSourceError as exc:
+            if isinstance(cache, dict) and cache.get("key") == cache_key and cache.get("snapshot") is not None:
+                st.sidebar.error(f"❌ {exc} Using the last Databricks pull.")
+                sap_snapshot = cache["snapshot"]
+                bom_load = cache["bom"]
+            else:
+                st.sidebar.error(f"❌ {exc} Using SAP uploads.")
+                st.session_state.pop("live_bom_frame", None)
+                sap_snapshot = upload_source.load()
+else:
+    st.session_state.pop("databricks_force_refresh", None)
     sap_snapshot = upload_source.load()
+
+if bom_load is not None and bom_load.accepted:
+    st.session_state["live_bom_frame"] = bom_load.frame
+    st.session_state["live_bom_accepted"] = True
+    if announce_bom:
+        st.sidebar.success(f"✅ Live BOM: **{len(bom_load.frame)} rows**. {bom_load.reason}")
+elif bom_load is not None:
+    st.session_state.pop("live_bom_frame", None)
+    if announce_bom:
+        st.sidebar.warning(f"⚠️ {bom_load.reason}")
 
 mb52_in, cogi_in, sto_in = sap_snapshot.mb52, sap_snapshot.cogi, sap_snapshot.sto
 
