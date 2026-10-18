@@ -319,13 +319,18 @@ def build_cogi_sql(table: str, columns: Sequence[str]) -> str:
     material = _require_column(columns, "matnr", "material")
     plant = _require_column(columns, "werks", "plant")
     qty = _require_column(columns, "erfmg", "menge", "qty")
+    filters = [f"UPPER({_sql_text(plant)}) LIKE '%M002%'"]
+    snapshot = stock_snapshot_column(columns)
+    if snapshot:
+        quoted = quote_column(snapshot)
+        filters.append(f"{quoted} = (SELECT MAX({quoted}) FROM {quote_table(table)})")
     return f"""
         SELECT
             {_sql_text(material)} AS `Material`,
             {_sql_text(plant)} AS `Plant`,
             {_sql_number(qty)} AS `Qty in Unit of Entry`
         FROM {quote_table(table)}
-        WHERE UPPER({_sql_text(plant)}) LIKE '%M002%'
+        WHERE {" AND ".join(filters)}
     """
 
 

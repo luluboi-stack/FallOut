@@ -163,6 +163,37 @@ def test_cogi_sql_uses_entry_quantity_at_m002():
     assert "M002" in sql
 
 
+def test_cogi_frame_keeps_the_latest_batch_timestamp_only():
+    columns = ["matnr", "werks", "lgort", "erfmg", "batch_id", "batch_ts"]
+    sql = build_cogi_sql("sap.sapabap1.affw_hourly", columns)
+    assert (
+        "`batch_ts` = (SELECT MAX(`batch_ts`) FROM `sap`.`sapabap1`.`affw_hourly`)"
+        in sql
+    )
+    assert "MAX(`batch_id`)" not in sql
+    assert "M002" in sql
+    assert "`erfmg`" in sql
+    assert "msgty" not in sql.lower() and "shkzg" not in sql.lower()
+
+    frame = pd.DataFrame({
+        "batch_ts": ["2026-10-18 08:00:00", "2026-10-18 09:00:00"],
+        "batch_id": [1, 2],
+        "Qty in Unit of Entry": [40, 7],
+    })
+    stamp = stock_snapshot_column(columns)
+    latest = frame[frame[stamp] == frame[stamp].max()]
+    assert latest["Qty in Unit of Entry"].sum() == 7
+    assert frame["Qty in Unit of Entry"].sum() != latest["Qty in Unit of Entry"].sum()
+
+    id_only = ["matnr", "werks", "menge", "batch_id"]
+    id_sql = build_cogi_sql("sap.sapabap1.affw_hourly", id_only)
+    assert (
+        "`batch_id` = (SELECT MAX(`batch_id`) FROM `sap`.`sapabap1`.`affw_hourly`)"
+        in id_sql
+    )
+    assert "`menge`" in id_sql
+
+
 def test_sto_sql_nets_goods_receipt_for_w004_to_m002():
     sql = build_sto_sql(
         "sap.sapabap1.ekko",
