@@ -3,6 +3,7 @@ import pytest
 
 from picklist_engine import (
     COLOUR_NONE,
+    supplement_bom,
     COLOUR_RED,
     COLOUR_YELLOW,
     COVERED,
@@ -224,6 +225,38 @@ def test_run_walk_end_to_end_lines_share_balance_and_hold_is_skipped():
     hu = rows[rows["part_key"] == "HU1"].iloc[0]
     assert hu["status"] == RED
     assert (rows["snapshot_id"] == "snap-x").all()
+
+
+def _bom_row(parent, child, desc, item="10", qty=1):
+    return {
+        "Parent Material": parent, "Child Material": child, "Description": desc,
+        "BOM Item Number": item, "Comp Qty.": qty, "Alt. BOM": "01",
+        "valid From": "2026-01-01", "Valid To": "9999-12-31",
+    }
+
+
+def test_supplement_bom_adds_missing_part_and_newer_revision():
+    old = pd.DataFrame([_bom_row("SEL1", "BW00001486FBB", "FRONT SHROUD AND BEZEL ASSEMBLY - Black")] * 8)
+    old = pd.concat([old, pd.DataFrame([_bom_row("SEL1", "KEEP1", "Kept part")] * 8)], ignore_index=True)
+    reference = pd.DataFrame([
+        _bom_row("SEL1", "BW00001486FBC", "FRONT SHROUD AND BEZEL ASSEMBLY - Black"),
+        _bom_row("SEL1", "NEW1", "Only on 16 Oct"),
+        _bom_row("SEL1", "KEEP1", "Kept part"),
+    ])
+    out = supplement_bom(old, reference)
+    children = set(out["Child Material"])
+    assert "BW00001486FBC" in children
+    assert "BW00001486FBB" not in children
+    assert "NEW1" in children
+    assert "KEEP1" in children
+    assert (out["Child Material"] == "KEEP1").sum() == 1
+
+
+def test_supplement_bom_leaves_a_normal_file_unchanged():
+    current = pd.DataFrame([_bom_row("SEL1", "PARTA", "Part")])
+    reference = pd.DataFrame([_bom_row("SEL1", "PARTB", "Other")])
+    out = supplement_bom(current, reference)
+    assert out["Child Material"].tolist() == ["PARTA"]
 
 
 def test_order_plan_sequences_offsets_per_line():

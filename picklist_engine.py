@@ -54,6 +54,79 @@ def clean_sap_key(val: Any) -> str:
     return s.lstrip("0")
 
 
+BOM_LINE_COLUMNS = [
+    "Parent Material", "Child Material", "BOM Item Number", "Comp Qty.",
+    "Alt. BOM", "valid From", "Valid To",
+]
+
+
+def _norm_desc(value: Any) -> str:
+    return " ".join(sorted(re.sub(r"[^a-z0-9]+", " ", str(value).lower()).split()))
+
+
+def _revision_stem(part: Any) -> str:
+    text = str(part).strip().upper()
+    if len(text) > 1 and text[-1].isalpha():
+        return text[:-1]
+    return text
+
+
+def dedupe_bom_lines(bom: pd.DataFrame) -> pd.DataFrame:
+    """One row per real BOM line. The 19 Oct file stores each line eight times."""
+    if bom is None or bom.empty:
+        return bom
+    columns = [col for col in BOM_LINE_COLUMNS if col in bom.columns]
+    if "Parent Material" not in columns or "Child Material" not in columns:
+        return bom
+    return bom.drop_duplicates(columns, keep="first").reset_index(drop=True)
+
+
+def bom_has_repeated_lines(bom: pd.DataFrame) -> bool:
+    if bom is None or bom.empty:
+        return False
+    keys = [col for col in ("Parent Material", "Child Material", "BOM Item Number", "Comp Qty.") if col in bom.columns]
+    if "Parent Material" not in keys or "Child Material" not in keys:
+        return False
+    counts = bom.groupby(keys, dropna=False).size()
+    return bool((counts >= 8).any())
+
+
+def supplement_bom(current: pd.DataFrame, reference: pd.DataFrame) -> pd.DataFrame:
+    """Use the 19 Oct lines, then add 16 Oct parts that are missing.
+
+    A repeated 19 Oct file is collapsed to one row per line. A part number that
+    only changed revision (same stem and description) keeps the reference part
+    and drops the old number. Any other loaded BOM is returned unchanged.
+    """
+    if current is None or current.empty or not bom_has_repeated_lines(current):
+        return current
+    current = dedupe_bom_lines(current)
+    if reference is None or reference.empty or "Child Material" not in getattr(reference, "columns", []):
+        return current
+    reference = dedupe_bom_lines(reference)
+    child = "Child Material"
+    current_parts = set(current[child].astype(str))
+    reference_parts = set(reference[child].astype(str))
+    only_current = current_parts - reference_parts
+    only_reference = reference_parts - current_parts
+    drop: Set[str] = set()
+    if "Description" in current.columns and "Description" in reference.columns and only_current and only_reference:
+        current_keys: Dict[Tuple[str, str], Set[str]] = {}
+        older = current.loc[current[child].astype(str).isin(only_current), [child, "Description"]].drop_duplicates()
+        for part, text in older.itertuples(index=False):
+            current_keys.setdefault((_revision_stem(part), _norm_desc(text)), set()).add(str(part))
+        newer = reference.loc[reference[child].astype(str).isin(only_reference), [child, "Description"]].drop_duplicates()
+        for part, text in newer.itertuples(index=False):
+            old_parts = current_keys.get((_revision_stem(part), _norm_desc(text)), set())
+            if len(old_parts) == 1:
+                drop.update(old_parts)
+    kept = current[~current[child].astype(str).isin(drop)]
+    added = reference[reference[child].astype(str).isin(only_reference)]
+    if added.empty:
+        return kept.reset_index(drop=True)
+    return pd.concat([kept, added], ignore_index=True)
+
+
 def find_column_by_priority(df: pd.DataFrame, candidates: List[str], exclude: List[str] = None) -> Optional[str]:
     exclude = exclude or []
     for cand in candidates:
