@@ -12,6 +12,7 @@ from data_sources import (
     DataSourceError,
     DataSourceNotConfigured,
     SapUploadSource,
+    accept_stas_bom,
     assess_bom_against_reference,
     build_bom_sql,
     build_cogi_sql,
@@ -27,12 +28,13 @@ from data_sources import (
 
 
 MAST_COLS = ["mandt", "matnr", "werks", "stlan", "stlal", "stlnr"]
-STPO_COLS = ["mandt", "stlnr", "stlal", "idnrk", "menge", "meins", "posnr", "lgort", "rgekz", "datuv", "lkenz", "postp"]
+STPO_COLS = ["mandt", "stlnr", "stlal", "stlkn", "idnrk", "menge", "meins", "posnr", "lgort", "rgekz", "datuv", "lkenz", "postp"]
 STOCK_COLS = ["matnr", "werks", "lgort", "labst", "loaded_at"]
 COGI_COLS = ["matnr", "werks", "erfmg", "loaded_at"]
 EKKO_COLS = ["mandt", "ebeln", "reswk", "loekz"]
 EKPO_COLS = ["mandt", "ebeln", "ebelp", "matnr", "werks", "loekz", "elikz"]
 EKET_COLS = ["mandt", "ebeln", "ebelp", "menge", "wemng"]
+STAS_TABLE_COLS = ["mandt", "stlty", "stlnr", "stlal", "stlkn", "stasz", "datuv", "lkenz"]
 
 TABLES = {
     "nsdm_v_mard_hourly": STOCK_COLS,
@@ -43,6 +45,7 @@ TABLES = {
     "eket": EKET_COLS,
     "mast": MAST_COLS,
     "stpo": STPO_COLS,
+    "stas": STAS_TABLE_COLS,
 }
 
 BOM_DESCRIPTION = [
@@ -74,6 +77,7 @@ def test_databricks_settings_default_warehouse_and_optional_token():
     assert settings.eket_table.endswith("eket")
     assert settings.mast_table.endswith("mast")
     assert settings.stpo_table.endswith("stpo")
+    assert settings.stas_table.endswith("stas")
     assert DatabricksSettings.missing({"host": "h"}, environ={}) == []
     overridden = DatabricksSettings.resolve({}, environ={
         "DATABRICKS_HOST": "https://other.cloud.databricks.com/",
@@ -232,8 +236,8 @@ def test_bom_sql_filters_production_alternative_and_stock_items():
     assert "`postp`" in sql and "'L'" in sql
     assert "`lkenz`" in sql
     assert "`datuv`" in sql
-    assert "9999-12-31" in sql
     assert "p.`stlal`" in sql
+    assert "datub" not in sql.lower()
 
 
 def test_bom_sql_divides_by_base_quantity_when_present():
@@ -270,7 +274,69 @@ def test_live_bom_accepted_when_level1_matches_and_subassembly_stays_below():
     assert "S450" not in result.frame["Parent Material"].tolist() or "KIT1" in set(result.frame["Child Material"])
 
 
-def test_live_bom_refused_when_alternatives_are_mixed():
+STAS_COLS = [
+    "mandt", "stlty", "stlnr", "stlal", "stlkn", "stasz", "datuv", "lkenz",
+]
+
+
+def test_stas_join_keeps_alt01_and_drops_alt02():
+    sql = build_bom_sql(
+        "sap.sapabap1.mast",
+        "sap.sapabap1.stpo",
+        MAST_COLS,
+        STPO_COLS,
+        "sap.sapabap1.stas",
+        STAS_COLS,
+    )
+    assert "INNER JOIN `sap`.`sapabap1`.`stas` a" in sql
+    assert "m.`stlnr`" in sql and "a.`stlnr`" in sql and "a.`stlal`" in sql
+    assert "a.`stlkn`" in sql and "p.`stlkn`" in sql
+    assert "a.`stasz`" not in sql
+    assert "a.`mandt`" in sql
+    assert "'M002'" in sql and "= '1'" in sql and "'01'" in sql
+    assert "'L'" in sql and "`menge`" in sql
+    assert "<> 'X'" in sql
+    assert "datub" not in sql.lower()
+
+    mast = pd.DataFrame({"STLNR": ["B1"], "STLAL": ["01"], "MATNR": ["S450"]})
+    stas = pd.DataFrame({
+        "STLNR": ["B1", "B1"],
+        "STLAL": ["01", "02"],
+        "STLKN": ["10", "20"],
+        "LKENZ": ["", ""],
+    })
+    stpo = pd.DataFrame({
+        "STLNR": ["B1", "B1"],
+        "STLKN": ["10", "20"],
+        "IDNRK": ["KEEP", "ALT02"],
+        "MENGE": [3.0, 9.0],
+        "POSTP": ["L", "L"],
+    })
+    linked = mast.merge(stas, on="STLNR").merge(stpo, on=["STLNR", "STLKN"])
+    linked = linked[linked["STLAL_x"].str.zfill(2) == linked["STLAL_y"].str.zfill(2)]
+    linked = linked[linked["STLAL_x"].str.zfill(2) == "01"]
+    assert linked["IDNRK"].tolist() == ["KEEP"]
+
+    live = pd.DataFrame({
+        "Parent Material": ["S450", "S450"],
+        "Child Material": ["KEEP", "NOT_IN_FILE"],
+        "Comp Qty.": [3.0, 5.0],
+    })
+    reference = pd.DataFrame({
+        "Parent Material": ["S450"],
+        "Explosion Level": ["1"],
+        "Child Material": ["OTHER"],
+        "Comp Qty.": ["1"],
+    })
+    accepted = accept_stas_bom(live)
+    assert accepted.accepted
+    assert set(accepted.frame["Child Material"]) == {"KEEP", "NOT_IN_FILE"}
+    assert accepted.reason == "Alternative 01 from STAS is the live BOM."
+    trimmed = assess_bom_against_reference(live, reference)
+    assert "NOT_IN_FILE" not in set(trimmed.frame["Child Material"])
+
+
+def test_live_bom_without_stas_keeps_only_overlapping_level1():
     reference = pd.DataFrame({
         "Parent Material": ["S450", "S450"],
         "Explosion Level": ["1", "1"],
@@ -278,51 +344,16 @@ def test_live_bom_refused_when_alternatives_are_mixed():
         "Comp Qty.": ["1", "2"],
     })
     live = pd.DataFrame({
-        "Parent Material": ["S450"] * 20,
-        "Child Material": [f"C{i}" for i in range(20)],
-        "Comp Qty.": ["1"] * 20,
+        "Parent Material": ["S450"] * 6,
+        "Child Material": ["KIT1", "PARTA", "X1", "X2", "X3", "X4"],
+        "Comp Qty.": ["8", "9", "1", "1", "1", "1"],
     })
     result = assess_bom_against_reference(live, reference)
-    assert isinstance(result, BomLoad)
-    assert not result.accepted
-    assert "stas" in result.reason
-
-
-def test_live_bom_refused_when_level1_components_differ():
-    children = [f"P{i}" for i in range(5)]
-    reference = pd.DataFrame({
-        "Parent Material": ["S450"] * 5,
-        "Explosion Level": ["1"] * 5,
-        "Child Material": children,
-        "Comp Qty.": ["1"] * 5,
-    })
-    live = pd.DataFrame({
-        "Parent Material": ["S450"] * 5,
-        "Child Material": [f"X{i}" for i in range(5)],
-        "Comp Qty.": ["1"] * 5,
-    })
-    result = assess_bom_against_reference(live, reference)
-    assert not result.accepted
-    assert "components" in result.reason
-
-
-def test_live_bom_refused_when_level1_quantities_disagree():
-    parents = ["S450"] * 5
-    children = [f"P{i}" for i in range(5)]
-    reference = pd.DataFrame({
-        "Parent Material": parents,
-        "Explosion Level": ["1"] * 5,
-        "Child Material": children,
-        "Comp Qty.": ["1"] * 5,
-    })
-    live = pd.DataFrame({
-        "Parent Material": parents,
-        "Child Material": children,
-        "Comp Qty.": ["9"] * 5,
-    })
-    result = assess_bom_against_reference(live, reference)
-    assert not result.accepted
-    assert "quantities" in result.reason
+    assert result.accepted
+    assert set(result.frame["Child Material"]) == {"KIT1", "PARTA"}
+    qty = dict(zip(result.frame["Child Material"], result.frame["Comp Qty."]))
+    assert qty["KIT1"] == 8
+    assert qty["PARTA"] == 9
 
 
 class RecordingCursor:
@@ -424,6 +455,7 @@ def test_pull_executes_describe_and_filtered_sql():
     sql = "\n".join(conn.sqls)
     assert "DESCRIBE TABLE `sap`.`sapabap1`.`mast`" in sql
     assert "DESCRIBE TABLE `sap`.`sapabap1`.`stpo`" in sql
+    assert "DESCRIBE TABLE `sap`.`sapabap1`.`stas`" in sql
     assert "DESCRIBE TABLE `sap`.`sapabap1`.`nsdm_v_mard_hourly`" in sql
     assert "'M002'" in sql and "'W004'" in sql
     assert "`wemng`" in sql

@@ -1,8 +1,9 @@
 """SAP stock sources for the sequence walk: MB52, COGI, and open STO plus a snapshot id.
 
-Databricks reads the sap.sapabap1 catalog. The BOM is a single-level mast-to-stpo
-link. The walk explodes it. A live BOM is used only after it matches the reference
-file's level-1 parents closely enough that alternative BOMs are not mixed in.
+Databricks reads the sap.sapabap1 catalog. The live BOM is mast joined to stas
+joined to stpo, so alternative 01 is the item nodes STAS assigns. The walk
+explodes that frame. The file is the fallback only when STAS is missing or the
+live query returns no rows.
 """
 import hashlib
 import os
@@ -49,6 +50,7 @@ DATABRICKS_TABLE_DEFAULTS = {
     "eket_table": f"{CATALOG}.eket",
     "mast_table": f"{CATALOG}.mast",
     "stpo_table": f"{CATALOG}.stpo",
+    "stas_table": f"{CATALOG}.stas",
 }
 
 DATABRICKS_TABLE_ENV = {
@@ -60,12 +62,10 @@ DATABRICKS_TABLE_ENV = {
     "eket_table": "DATABRICKS_EKET_TABLE",
     "mast_table": "DATABRICKS_MAST_TABLE",
     "stpo_table": "DATABRICKS_STPO_TABLE",
+    "stas_table": "DATABRICKS_STAS_TABLE",
 }
 
-# A vehicle whose live direct-child count exceeds this is treated as a mixed alternative.
-BOM_MIX_RATIO = 1.5
-BOM_MIX_EXTRA = 10
-BOM_QTY_TOLERANCE = 0.01
+STAS_BOM_MESSAGE = "Alternative 01 from STAS is the live BOM."
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TIMESTAMP_CANDIDATES = (
@@ -156,6 +156,7 @@ class DatabricksSettings:
     eket_table: str
     mast_table: str
     stpo_table: str
+    stas_table: str
 
     @classmethod
     def resolve(
@@ -436,8 +437,28 @@ def _aliased_number(alias: str, column: str) -> str:
     return f"CAST({_qualified(alias, column)} AS DOUBLE)"
 
 
-def build_bom_sql(mast_table: str, stpo_table: str, mast_columns: Sequence[str], stpo_columns: Sequence[str]) -> str:
-    """Immediate parent-to-child links for plant M002, production usage, alternative 01."""
+def _not_deleted(alias: str, columns: Sequence[str]) -> Optional[str]:
+    """LKENZ empty or not X. A deletion flag of X drops the node."""
+    column = find_column(columns, "lkenz")
+    if column is None:
+        return None
+    text = _aliased_text(alias, column)
+    return f"({text} IS NULL OR {text} = '' OR UPPER({text}) <> 'X')"
+
+
+def build_bom_sql(
+    mast_table: str,
+    stpo_table: str,
+    mast_columns: Sequence[str],
+    stpo_columns: Sequence[str],
+    stas_table: Optional[str] = None,
+    stas_columns: Optional[Sequence[str]] = None,
+) -> str:
+    """Parent-to-child links for plant M002, production usage, alternative 01.
+
+    With STAS, mast joins stas on STLNR + STLAL, and stas joins stpo on STLNR + STLKN.
+    STASZ is not a STPO key unless STPO itself has that column.
+    """
     matnr = _require_column(mast_columns, "matnr")
     stlnr_m = _require_column(mast_columns, "stlnr")
     stlnr_p = _require_column(stpo_columns, "stlnr")
@@ -446,6 +467,7 @@ def build_bom_sql(mast_table: str, stpo_table: str, mast_columns: Sequence[str],
     werks = _require_column(mast_columns, "werks")
     stlan = _require_column(mast_columns, "stlan")
     stlal = _require_column(mast_columns, "stlal")
+    use_stas = bool(stas_table and stas_columns)
 
     base = find_column(stpo_columns, "bmeng", "base_qty", "base_quantity") or find_column(
         mast_columns, "bmeng", "base_qty", "base_quantity"
@@ -466,17 +488,15 @@ def build_bom_sql(mast_table: str, stpo_table: str, mast_columns: Sequence[str],
             return default
         return _aliased_text(alias, found)
 
-    valid_to = find_column(stpo_columns, "datub", "valid_to", "validto")
-    valid_to_sql = _aliased_text("p", valid_to) if valid_to else "'9999-12-31'"
-
-    join = f"{_aliased_text('m', stlnr_m)} = {_aliased_text('p', stlnr_p)}"
-    mandt_m = find_column(mast_columns, "mandt")
-    mandt_p = find_column(stpo_columns, "mandt")
-    if mandt_m and mandt_p:
-        join += f" AND {_aliased_text('m', mandt_m)} = {_aliased_text('p', mandt_p)}"
-    stlal_p = find_column(stpo_columns, "stlal")
-    if stlal_p:
-        join += f" AND LPAD({_aliased_text('m', stlal)}, 2, '0') = LPAD({_aliased_text('p', stlal_p)}, 2, '0')"
+    valid_to = find_column(stpo_columns, "datub", "valid_to", "validto") or find_column(
+        mast_columns, "datub", "valid_to", "validto"
+    )
+    if valid_to and valid_to in stpo_columns:
+        valid_to_sql = _aliased_text("p", valid_to)
+    elif valid_to:
+        valid_to_sql = _aliased_text("m", valid_to)
+    else:
+        valid_to_sql = "''"
 
     filters = [
         f"UPPER({_aliased_text('m', werks)}) = 'M002'",
@@ -487,14 +507,71 @@ def build_bom_sql(mast_table: str, stpo_table: str, mast_columns: Sequence[str],
     postp = find_column(stpo_columns, "postp")
     if postp:
         filters.append(f"UPPER({_aliased_text('p', postp)}) = 'L'")
-    lkenz = find_column(stpo_columns, "lkenz")
-    if lkenz:
-        filters.append(f"({_aliased_text('p', lkenz)} IS NULL OR {_aliased_text('p', lkenz)} = '')")
-    datuv = find_column(stpo_columns, "datuv")
-    if datuv:
-        filters.append(_on_or_before_today("p", datuv))
-    if valid_to:
+    deleted_p = _not_deleted("p", stpo_columns)
+    if deleted_p:
+        filters.append(deleted_p)
+    datuv_p = find_column(stpo_columns, "datuv")
+    if datuv_p:
+        filters.append(_on_or_before_today("p", datuv_p))
+    if valid_to and valid_to in stpo_columns:
         filters.append(_on_or_after_today("p", valid_to))
+    elif valid_to:
+        filters.append(_on_or_after_today("m", valid_to))
+
+    if use_stas:
+        stlnr_a = _require_column(stas_columns, "stlnr")
+        stlal_a = _require_column(stas_columns, "stlal")
+        stlkn_a = _require_column(stas_columns, "stlkn")
+        stlkn_p = _require_column(stpo_columns, "stlkn")
+        mast_stas = (
+            f"{_aliased_text('m', stlnr_m)} = {_aliased_text('a', stlnr_a)}"
+            f" AND LPAD({_aliased_text('m', stlal)}, 2, '0') = LPAD({_aliased_text('a', stlal_a)}, 2, '0')"
+        )
+        mandt_m = find_column(mast_columns, "mandt")
+        mandt_a = find_column(stas_columns, "mandt")
+        mandt_p = find_column(stpo_columns, "mandt")
+        if mandt_m and mandt_a:
+            mast_stas += f" AND {_aliased_text('m', mandt_m)} = {_aliased_text('a', mandt_a)}"
+        stas_stpo = (
+            f"{_aliased_text('a', stlnr_a)} = {_aliased_text('p', stlnr_p)}"
+            f" AND {_aliased_text('a', stlkn_a)} = {_aliased_text('p', stlkn_p)}"
+        )
+        if mandt_a and mandt_p:
+            stas_stpo += f" AND {_aliased_text('a', mandt_a)} = {_aliased_text('p', mandt_p)}"
+        stasz_a = find_column(stas_columns, "stasz")
+        stasz_p = find_column(stpo_columns, "stasz")
+        if stasz_a and stasz_p:
+            stas_stpo += f" AND {_aliased_text('a', stasz_a)} = {_aliased_text('p', stasz_p)}"
+        stlty = find_column(stas_columns, "stlty")
+        if stlty:
+            filters.append(f"UPPER({_aliased_text('a', stlty)}) = 'M'")
+        deleted_a = _not_deleted("a", stas_columns)
+        if deleted_a:
+            filters.append(deleted_a)
+        datuv_a = find_column(stas_columns, "datuv")
+        if datuv_a:
+            filters.append(_on_or_before_today("a", datuv_a))
+        from_sql = f"""
+        FROM {quote_table(mast_table)} m
+        INNER JOIN {quote_table(stas_table)} a
+            ON {mast_stas}
+        INNER JOIN {quote_table(stpo_table)} p
+            ON {stas_stpo}
+        """
+    else:
+        join = f"{_aliased_text('m', stlnr_m)} = {_aliased_text('p', stlnr_p)}"
+        mandt_m = find_column(mast_columns, "mandt")
+        mandt_p = find_column(stpo_columns, "mandt")
+        if mandt_m and mandt_p:
+            join += f" AND {_aliased_text('m', mandt_m)} = {_aliased_text('p', mandt_p)}"
+        stlal_p = find_column(stpo_columns, "stlal")
+        if stlal_p:
+            join += f" AND LPAD({_aliased_text('m', stlal)}, 2, '0') = LPAD({_aliased_text('p', stlal_p)}, 2, '0')"
+        from_sql = f"""
+        FROM {quote_table(mast_table)} m
+        INNER JOIN {quote_table(stpo_table)} p
+            ON {join}
+        """
 
     return f"""
         SELECT
@@ -511,9 +588,7 @@ def build_bom_sql(mast_table: str, stpo_table: str, mast_columns: Sequence[str],
             {optional('p', stpo_columns, 'rgekz')} AS `Back Flush`,
             {optional('p', stpo_columns, 'datuv')} AS `valid From`,
             {valid_to_sql} AS `Valid To`
-        FROM {quote_table(mast_table)} m
-        INNER JOIN {quote_table(stpo_table)} p
-            ON {join}
+        {from_sql}
         WHERE {" AND ".join(filters)}
     """
 
@@ -568,86 +643,86 @@ def _pair_sets(frame: pd.DataFrame, level_one_only: bool) -> dict[str, dict[str,
     return pairs
 
 
-def assess_bom_against_reference(live: pd.DataFrame, reference: pd.DataFrame) -> BomLoad:
-    """Refuse a live BOM that has far more direct children than the reference level-1 file.
-
-    The reference file hangs every explosion level on the vehicle. Only its level-1 rows
-    are the immediate links. Extra live children on a vehicle mean stpo items from other
-    alternatives were joined in, which needs STAS.
-    """
+def accept_stas_bom(live: pd.DataFrame) -> BomLoad:
+    """STAS alternative 01 is the source of truth. Extra children are kept."""
     if live is None or live.empty:
-        return BomLoad(live if live is not None else pd.DataFrame(), False, "Live BOM query returned no rows. Staying on the file.")
+        return BomLoad(
+            pd.DataFrame(columns=["Parent Material", "Child Material", "Comp Qty."]),
+            False,
+            "Live BOM query returned no rows. Staying on the file.",
+        )
+    return BomLoad(live, True, STAS_BOM_MESSAGE)
+
+
+def _bom_labels(frame: pd.DataFrame, level_one_only: bool) -> tuple[dict, dict]:
+    parent_col = _column_named(frame, "parent material", "parent")
+    child_col = _column_named(frame, "child material", "component")
+    parents: dict[str, str] = {}
+    children: dict[tuple[str, str], str] = {}
+    if not parent_col or not child_col or frame is None or frame.empty:
+        return parents, children
+    work = frame
+    if level_one_only:
+        level_col = _column_named(frame, "explosion level", "level")
+        if level_col:
+            level = work[level_col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+            work = work[level.isin(["1"])]
+    for _, row in work.iterrows():
+        parent = clean_sap_key(row[parent_col])
+        child = clean_sap_key(row[child_col])
+        if not parent or not child:
+            continue
+        parents.setdefault(parent, str(row[parent_col]).strip())
+        children.setdefault((parent, child), str(row[child_col]).strip())
+    return parents, children
+
+
+def assess_bom_against_reference(live: pd.DataFrame, reference: pd.DataFrame) -> BomLoad:
+    """Overlap-trim used only when STAS is missing or the STAS query is empty.
+
+    Shared parents keep live children that are also reference level-1 links, with the
+    live quantity. A shared parent with no overlap keeps the file level-1 rows.
+    Parents only in the file stay on those level-1 rows. Live-only parents are dropped.
+    """
+    columns = ["Parent Material", "Child Material", "Comp Qty."]
+    if live is None or live.empty:
+        return BomLoad(pd.DataFrame(columns=columns), False, "Live BOM query returned no rows. Staying on the file.")
     if reference is None or reference.empty:
-        return BomLoad(live, False, "Reference BOM is missing, so the live BOM was not switched on.")
+        return BomLoad(pd.DataFrame(columns=columns), False, "Reference BOM is missing, so the live BOM was not switched on.")
 
     live_pairs = _pair_sets(live, level_one_only=False)
     file_pairs = _pair_sets(reference, level_one_only=True)
-    shared = sorted(set(live_pairs) & set(file_pairs))
-    if not shared:
-        return BomLoad(
-            live,
-            False,
-            "Live BOM shares no vehicle parents with the reference file, so it was not switched on.",
-        )
-
-    inflated = []
-    missing = []
-    compared = 0
-    agreed = 0
-    file_total = 0
-    overlap = 0
-    for parent in shared:
-        live_children = live_pairs[parent]
-        file_children = file_pairs[parent]
-        live_n = len(live_children)
-        file_n = len(file_children)
-        file_total += file_n
-        overlap += len(set(file_children) & set(live_children))
-        if file_n > 0 and live_n == 0:
-            missing.append(parent)
-        if live_n > max(file_n * BOM_MIX_RATIO, file_n + BOM_MIX_EXTRA):
-            inflated.append(parent)
-        for child, file_qty in file_children.items():
-            if child not in live_children:
-                continue
-            compared += 1
-            if abs(live_children[child] - file_qty) <= BOM_QTY_TOLERANCE:
-                agreed += 1
-
-    if inflated:
-        sample = ", ".join(inflated[:5])
-        return BomLoad(
-            live,
-            False,
-            "Live BOM has far more direct components than the reference level-1 BOM for "
-            f"{len(inflated)} parents (for example {sample}). stas is required to keep alternative 01 only. "
-            "Staying on the file.",
-        )
-    if len(missing) > len(shared) * 0.5:
-        return BomLoad(
-            live,
-            False,
-            "Live BOM is missing direct components for most reference vehicles. Staying on the file.",
-        )
-    if file_total >= 5 and overlap / file_total < 0.5:
-        return BomLoad(
-            live,
-            False,
-            "Level-1 components do not match the reference BOM. Staying on the file.",
-        )
-    if compared >= 5 and agreed / compared < 0.5:
-        return BomLoad(
-            live,
-            False,
-            "Level-1 component quantities do not match the reference BOM. Staying on the file.",
-        )
-    qty_note = ""
-    if compared and agreed != compared:
-        qty_note = f" {compared - agreed} matched level-1 quantities differ."
+    live_parents, live_children = _bom_labels(live, False)
+    file_parents, file_children = _bom_labels(reference, True)
+    rows = []
+    for parent in sorted(file_pairs):
+        file_set = file_pairs[parent]
+        live_set = live_pairs.get(parent)
+        if live_set:
+            overlap = {child: live_set[child] for child in file_set if child in live_set}
+        else:
+            overlap = {}
+        if overlap:
+            labels_parent = live_parents
+            labels_child = live_children
+            chosen = overlap
+        else:
+            labels_parent = file_parents
+            labels_child = file_children
+            chosen = file_set
+        for child, qty in sorted(chosen.items()):
+            rows.append({
+                "Parent Material": labels_parent.get(parent, parent),
+                "Child Material": labels_child.get((parent, child), child),
+                "Comp Qty.": qty,
+            })
+    frame = pd.DataFrame(rows, columns=columns)
+    if frame.empty:
+        return BomLoad(frame, False, "Live BOM query returned no rows. Staying on the file.")
     return BomLoad(
-        live,
+        frame,
         True,
-        f"Live BOM matches reference level-1 counts for {len(shared)} parents.{qty_note}",
+        "Live BOM trimmed to reference level-1 links because STAS was not available.",
     )
 
 
@@ -746,8 +821,26 @@ class DatabricksSource:
         s = self.settings
         mast_cols = self._describe(conn, s.mast_table)
         stpo_cols = self._describe(conn, s.stpo_table)
+        stas_cols = self._describe_stas(conn)
+        if stas_cols:
+            frame = self._query(
+                conn,
+                build_bom_sql(
+                    s.mast_table, s.stpo_table, mast_cols, stpo_cols, s.stas_table, stas_cols
+                ),
+            )
+            if frame is not None and not frame.empty:
+                return accept_stas_bom(frame)
         frame = self._query(conn, build_bom_sql(s.mast_table, s.stpo_table, mast_cols, stpo_cols))
         return assess_bom_against_reference(frame, reference)
+
+    def _describe_stas(self, conn) -> Optional[list[str]]:
+        try:
+            return self._describe(conn, self.settings.stas_table)
+        except Exception as exc:
+            if _is_missing_table(exc):
+                return None
+            raise
 
     def _cogi_columns(self, conn) -> tuple[str, list[str]]:
         s = self.settings
