@@ -35,6 +35,7 @@ from picklist_engine import (
     find_column_by_priority,
     order_plan_sequences,
     run_walk,
+    supplement_bom,
 )
 from walk_store import (
     WALK_NEW,
@@ -73,29 +74,32 @@ LOCAL_BOM_PATH = find_local_file(["BOM_FINAL_EXPLODED (15th Oct).parquet"])
 LOCAL_LX02_PATH = find_local_file(["lx02.csv", "LX02.csv", "LX02.CSV", "lx02.xlsx", "LX02.xlsx", "lx02.xls", "LX02.xls", "LMAO - Data.csv"])
 LOCAL_STO_PATH = find_local_file(["sto.csv", "STO.csv", "open_sto.csv", "open_sto.xlsx", "sto.xlsx", "SIT sep 13 pm.xlsx"])
 
+def _reference_bom() -> pd.DataFrame:
+    path = find_local_file(["bom.csv"])
+    if not path:
+        return pd.DataFrame()
+    return pd.read_csv(path, low_memory=False)
+
+
 @st.cache_data(show_spinner="⚡ Loading 400K BOM into RAM (takes < 1 sec)...")
 def get_master_bom_df() -> pd.DataFrame:
     """Loads 400K BOM once into RAM and caches it. Sub-second subsequent loads."""
     # 1. Check if user manually uploaded a BOM
     if "uploaded_bom_df" in st.session_state and not st.session_state["uploaded_bom_df"].empty:
-        return st.session_state["uploaded_bom_df"]
+        loaded = st.session_state["uploaded_bom_df"]
+    elif not LOCAL_BOM_PATH or not os.path.exists(LOCAL_BOM_PATH):
+        loaded = pd.DataFrame()
+    else:
+        loaded = _read_local_bom(LOCAL_BOM_PATH)
+    return supplement_bom(loaded, _reference_bom())
 
-    # 2. Check local files
-    if not LOCAL_BOM_PATH or not os.path.exists(LOCAL_BOM_PATH):
-        return pd.DataFrame()
 
-    file_path = LOCAL_BOM_PATH
+def _read_local_bom(file_path: str) -> pd.DataFrame:
     parquet_cache = os.path.join(BASE_DIR, "bom.parquet")
-
-    # Fast path: Parquet exists
     if file_path.endswith(".parquet"):
         return pd.read_parquet(file_path)
-    
-    # If parquet cache exists and is newer than the source file
     if os.path.exists(parquet_cache) and os.path.getmtime(parquet_cache) >= os.path.getmtime(file_path):
         return pd.read_parquet(parquet_cache)
-
-    # Fast path: CSV
     if file_path.endswith(".csv"):
         df = pd.read_csv(file_path, dtype=str, low_memory=False)
         try:
@@ -103,8 +107,6 @@ def get_master_bom_df() -> pd.DataFrame:
         except Exception:
             pass
         return df
-
-    # Slow path: XLSX (Convert once to Parquet so it never lags again)
     df = pd.read_excel(file_path, dtype=str)
     try:
         df.to_parquet(parquet_cache, compression="snappy")
