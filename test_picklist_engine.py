@@ -1,5 +1,9 @@
+from pathlib import Path
+
 import pandas as pd
 import pytest
+
+from check_bom_duplicates import read_bom, repeated_lines
 
 from picklist_engine import (
     COLOUR_NONE,
@@ -250,6 +254,15 @@ def test_supplement_bom_adds_missing_part_and_newer_revision():
     assert "NEW1" in children
     assert "KEEP1" in children
     assert (out["Child Material"] == "KEEP1").sum() == 1
+
+
+def test_check_bom_duplicates_lists_the_repeated_line():
+    loaded = read_bom(Path("test_bom_eight_copies.xlsx"))
+    repeated = repeated_lines(loaded)
+    assert len(loaded) == 9
+    assert len(repeated) == 1
+    assert repeated.iloc[0]["Child Material"] == "BW00001486FBB"
+    assert int(repeated.iloc[0]["Copies"]) == 8
 
 
 def test_xlsx_eight_copies_collapse_to_one_line():
