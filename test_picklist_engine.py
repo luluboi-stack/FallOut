@@ -252,6 +252,16 @@ def test_supplement_bom_adds_missing_part_and_newer_revision():
     assert (out["Child Material"] == "KEEP1").sum() == 1
 
 
+def test_xlsx_eight_copies_collapse_to_one_line():
+    loaded = pd.read_excel("test_bom_eight_copies.xlsx", dtype=str)
+    assert len(loaded) == 9
+    assert (loaded["Child Material"] == "BW00001486FBB").sum() == 8
+    out = supplement_bom(loaded, pd.DataFrame())
+    assert (out["Child Material"] == "BW00001486FBB").sum() == 1
+    assert (out["Child Material"] == "ONLYONCE").sum() == 1
+    assert len(out) == 2
+
+
 def test_supplement_bom_leaves_a_normal_file_unchanged():
     current = pd.DataFrame([_bom_row("SEL1", "PARTA", "Part")])
     reference = pd.DataFrame([_bom_row("SEL1", "PARTB", "Other")])
