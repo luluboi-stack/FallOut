@@ -6,6 +6,7 @@ Usage:
 """
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 import pandas as pd
 
@@ -29,7 +30,7 @@ def read_bom(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, dtype=str, low_memory=False)
 
 
-def find_local_bom(folder: Path) -> Path | None:
+def find_local_bom(folder: Path) -> Optional[Path]:
     for name in LOCAL_NAMES:
         candidate = folder / name
         if candidate.exists():
@@ -71,7 +72,7 @@ def report(path: Path) -> int:
     return 0
 
 
-def main(argv: list[str]) -> int:
+def main(argv: List[str]) -> int:
     if len(argv) > 1:
         path = Path(argv[1])
     else:
