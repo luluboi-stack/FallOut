@@ -8,9 +8,10 @@ Live SSO (a browser opens once; no personal access token):
 
     python3 -m streamlit run bom_databricks_view.py
 
-Install once if needed (NumPy 2 is required by the Streamlit table):
+Install once if needed (NumPy 2 is required by the Streamlit table).
+On a Mac, `pip` is often missing from PATH, so use `python3 -m pip`:
 
-    pip install streamlit pandas 'numpy>=2' databricks-sql-connector
+    python3 -m pip install -r requirements-bom-view.txt
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ def page(demo: bool) -> None:
         except DataSourceError as exc:
             st.error(str(exc))
             st.stop()
-    st.dataframe(frame, use_container_width=True, hide_index=True)
+    st.dataframe(frame, width="stretch", hide_index=True)
     st.caption(f"{len(frame)} component rows")
 
 
