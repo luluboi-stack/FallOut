@@ -221,6 +221,24 @@ def _not_deleted(alias: str, columns: Sequence[str]) -> Optional[str]:
     return f"({text} IS NULL OR {text} = '' OR UPPER({text}) <> 'X')"
 
 
+def _parent_prefix_filter(material_sql: str, prefixes: Optional[Sequence[str]]) -> Optional[str]:
+    """Limit a parent material to the given prefixes. None leaves the query unchanged."""
+    if not prefixes:
+        return None
+    cleaned: list[str] = []
+    for raw in prefixes:
+        prefix = str(raw).strip().upper()
+        if not prefix:
+            continue
+        if re.fullmatch(r"[A-Z0-9]+", prefix) is None:
+            raise DataSourceError(f"Unsafe parent prefix: {raw}")
+        cleaned.append(prefix)
+    if not cleaned:
+        return None
+    body = f"UPPER(REGEXP_REPLACE({material_sql}, '^0+', ''))"
+    return "(" + " OR ".join(f"{body} LIKE '{prefix}%'" for prefix in cleaned) + ")"
+
+
 def build_bom_sql(
     mast_table: str,
     stpo_table: str,
@@ -228,12 +246,14 @@ def build_bom_sql(
     stpo_columns: Sequence[str],
     stas_table: Optional[str] = None,
     stas_columns: Optional[Sequence[str]] = None,
+    parent_prefixes: Optional[Sequence[str]] = None,
 ) -> str:
     """Parent-to-child links for plant M002, production usage, alternative 01.
 
     With STAS, mast joins stas on STLNR + STLAL, and stas joins stpo on STLNR + STLKN.
     MANDT is added when both sides have it. STASZ is not a STPO key unless STPO
     itself has that column. STAS has no DATUB; valid-to comes from stpo or mast.
+    parent_prefixes limits the parent material. Omit it and the parent set is unchanged.
     """
     matnr = _require_column(mast_columns, "matnr")
     stlnr_m = _require_column(mast_columns, "stlnr")
@@ -349,6 +369,10 @@ def build_bom_sql(
             ON {join}
         """
 
+    prefix_sql = _parent_prefix_filter(_aliased_text("m", matnr), parent_prefixes)
+    if prefix_sql:
+        filters.append(prefix_sql)
+
     return f"""
         SELECT
             {_aliased_text('m', matnr)} AS `Parent Material`,
@@ -429,8 +453,14 @@ def _query(conn, sql: str) -> pd.DataFrame:
     return pd.DataFrame.from_records(list(rows), columns=columns)
 
 
-def load_live_bom(settings: Optional[DatabricksSettings] = None) -> pd.DataFrame:
-    """Describe mast, stas, and stpo, then return the direct parent-child links."""
+def load_live_bom(
+    settings: Optional[DatabricksSettings] = None,
+    parent_prefixes: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Describe mast, stas, and stpo, then return the direct parent-child links.
+
+    parent_prefixes limits parents when passed. The BOM viewer omits it.
+    """
     resolved = settings or DatabricksSettings.resolve()
     if databricks_sql is None:
         raise DataSourceError(
@@ -448,6 +478,7 @@ def load_live_bom(settings: Optional[DatabricksSettings] = None) -> pd.DataFrame
                 stpo_cols,
                 resolved.stas_table,
                 stas_cols,
+                parent_prefixes=parent_prefixes,
             )
             return bom_table(_query(conn, sql))
     except DataSourceError:
