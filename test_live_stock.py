@@ -21,6 +21,7 @@ from live_stock import (
     build_stock_sql,
     compare_bom_stock,
     empty_cogi,
+    explode_walk_bom,
     empty_sto,
     load_bom_frame,
     load_cogi_frame,
@@ -224,7 +225,8 @@ def test_open_sto_sql_uses_received_quantity_not_ordered_quantity():
     assert "po.`wemng`" not in sql
     assert "GREATEST" in sql
     assert "'W004'" in sql and "'M002'" in sql
-    assert "IN ('UB')" in sql
+    assert "IN ('UB')" not in sql
+    assert "REGEXP_REPLACE" in sql
     assert "`loekz`" in sql and "`elikz`" in sql
     assert "> 0" in sql
 
@@ -352,11 +354,37 @@ def test_live_bom_query_limits_walk_parents(monkeypatch):
     monkeypatch.setattr(bom_databricks, "_describe", describe)
     monkeypatch.setattr(bom_databricks, "_query", query)
     frame = load_bom_frame(object(), DatabricksSettings.resolve(environ={}))
-    assert "LIKE 'S450%'" in seen[0]
-    assert "LIKE 'SEL%'" in seen[0]
-    assert "LIKE 'SRIZ%'" in seen[0]
-    assert list(frame.columns)
+    assert "LIKE 'S450%'" not in seen[0]
     assert frame["Child Material"].iloc[0] == "P"
+    assert frame["Walk SKU"].iloc[0] == "S450X"
+
+
+def test_child_with_another_parent_is_exploded_under_the_walk_sku():
+    bom = explode_walk_bom(
+        pd.DataFrame(
+            {
+                "Parent Material": ["S450X", "KIT9", "KIT9", "OTHERPARENT"],
+                "Child Material": ["KIT9", "PART1", "PART0", "NOISE"],
+            }
+        )
+    )
+    links = set(zip(bom["Walk SKU"], bom["Parent Material"], bom["Child Material"]))
+    assert ("S450X", "S450X", "KIT9") in links
+    assert ("S450X", "KIT9", "PART1") in links
+    assert ("S450X", "KIT9", "PART0") in links
+    assert "NOISE" not in set(bom["Child Material"])
+    stock = pd.DataFrame(
+        [
+            _stock_row("PART1", "M002", "RM01", 6),
+            _stock_row("KIT9", "M002", "RM01", 0),
+        ]
+    )
+    sto = pd.DataFrame({"Material": ["PART1"], "Open Qty": [4]})
+    result = compare_bom_stock(bom, stock, empty_cogi(), sto)
+    assert result["missing_unrestricted"]["Material"].tolist() == ["PART0"]
+    assert result["missing_unrestricted"]["Walk SKU"].tolist() == ["S450X"]
+    assert result["sto_not_on_bom"].empty
+    assert result["quantities"].set_index("Material").loc["PART1", "open_sto"] == 4
 
 
 def test_stock_table_names_follow_env():

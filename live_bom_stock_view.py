@@ -70,7 +70,10 @@ def _equation(feeds: PageFeeds) -> pd.DataFrame | None:
 
 def _render_bom(feeds: PageFeeds) -> None:
     prefixes = ", ".join(WALK_PARENT_PREFIXES)
-    st.caption(f"Parents limited to {prefixes}. Plant M002, usage 1, alternative 01.")
+    st.caption(
+        f"Walk SKUs {prefixes}. A child that has another parent is kept as that child "
+        "and its own BOM is exploded under the same walk SKU."
+    )
     if feeds.bom_error:
         st.error(feeds.bom_error)
         return

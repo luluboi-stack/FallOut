@@ -43,9 +43,6 @@ EKPO_TABLE = "sap.sapabap1.ekpo"
 # STO schedule line: open qty is menge minus wemng. Env: DATABRICKS_EKET_TABLE.
 EKET_TABLE = "sap.sapabap1.eket"
 
-# EKKO-BSART for a stock transport order. UB is the standard document type.
-STO_DOCUMENT_TYPES = ("UB",)
-
 # Parents the replenishment walk reads.
 WALK_PARENT_PREFIXES = ("S450", "SEL", "SRIZ")
 
@@ -200,6 +197,13 @@ def _eq(left_alias: str, left_col: str, right_alias: str, right_col: str) -> str
     return f"{_aliased_text(left_alias, left_col)} = {_aliased_text(right_alias, right_col)}"
 
 
+def _eq_doc(left_alias: str, left_col: str, right_alias: str, right_col: str) -> str:
+    """Match a purchasing-document key with or without leading zeros."""
+    left = f"REGEXP_REPLACE({_aliased_text(left_alias, left_col)}, '^0+', '')"
+    right = f"REGEXP_REPLACE({_aliased_text(right_alias, right_col)}, '^0+', '')"
+    return f"{left} = {right}"
+
+
 def _and_mandt(
     clause: str,
     left_alias: str,
@@ -251,13 +255,12 @@ def build_open_sto_sql(
     ebelp_i = _require_column(ekpo_columns, "ebelp")
     matnr = _require_column(ekpo_columns, "matnr")
     reswk = _require_column(ekko_columns, "reswk")
-    bsart = _require_column(ekko_columns, "bsart")
     werks = _require_column(ekpo_columns, "werks")
     loekz_i = _require_column(ekpo_columns, "loekz")
     elikz = _require_column(ekpo_columns, "elikz")
 
     header_item = _and_mandt(
-        _eq("ko", ebeln_h, "po", ebeln_i),
+        _eq_doc("ko", ebeln_h, "po", ebeln_i),
         "ko",
         ekko_columns,
         "po",
@@ -274,7 +277,7 @@ def build_open_sto_sql(
             ebeln_e = _require_column(eket_columns, "ebeln")
             ebelp_e = _require_column(eket_columns, "ebelp")
             schedule = _and_mandt(
-                _eq("po", ebeln_i, "et", ebeln_e) + " AND " + _eq("po", ebelp_i, "et", ebelp_e),
+                _eq_doc("po", ebeln_i, "et", ebeln_e) + " AND " + _eq_doc("po", ebelp_i, "et", ebelp_e),
                 "po",
                 ekpo_columns,
                 "et",
@@ -284,11 +287,10 @@ def build_open_sto_sql(
             qty_alias = "et"
             qty_columns = eket_columns
     open_expr = _open_qty_expr(qty_alias, qty_columns)
-    types = ", ".join(f"'{name}'" for name in STO_DOCUMENT_TYPES)
+    # RESWK is filled only on a stock transport. Document type is not limited to UB.
     filters = [
         f"UPPER({_aliased_text('ko', reswk)}) = 'W004'",
         f"UPPER({_aliased_text('po', werks)}) = 'M002'",
-        f"UPPER({_aliased_text('ko', bsart)}) IN ({types})",
         _is_blank("po", loekz_i),
         _is_blank("po", elikz),
         f"{open_expr} > 0",
@@ -416,6 +418,55 @@ def tool_quantities(stock: pd.DataFrame, cogi: pd.DataFrame, sto: pd.DataFrame) 
     return pd.DataFrame(rows, columns=EQUATION_COLUMNS)
 
 
+def explode_walk_bom(
+    bom: pd.DataFrame,
+    prefixes: Sequence[str] = WALK_PARENT_PREFIXES,
+) -> pd.DataFrame:
+    """Walk S450, SEL, and SRIZ, then explode any child that is itself a parent.
+
+    The other parent stays the child of the walk SKU. Its components are added
+    with that same walk SKU, so stock and open STO follow the component.
+    """
+    if bom is None or bom.empty:
+        return bom
+    parent_col = _frame_column(bom, "Parent Material")
+    child_col = _frame_column(bom, "Child Material")
+    if parent_col is None or child_col is None:
+        return bom
+    work = bom.copy()
+    work["_parent"] = work[parent_col].map(clean_sap_key)
+    work["_child"] = work[child_col].map(clean_sap_key)
+    grouped: dict[str, list[int]] = {}
+    for idx, parent in work["_parent"].items():
+        if parent:
+            grouped.setdefault(str(parent), []).append(idx)
+    seeds = sorted(key for key in grouped if any(key.startswith(prefix) for prefix in prefixes))
+    keep_idx: list[int] = []
+    walk_skus: list[str] = []
+    for seed in seeds:
+        seen: set[str] = set()
+        stack = [seed]
+        while stack:
+            parent = stack.pop()
+            if parent in seen:
+                continue
+            seen.add(parent)
+            for idx in grouped.get(parent, []):
+                keep_idx.append(idx)
+                walk_skus.append(seed)
+                child = str(work.at[idx, "_child"])
+                if child and child not in seen and child in grouped:
+                    stack.append(child)
+    trimmed = work.drop(columns=["_parent", "_child"])
+    if not keep_idx:
+        empty = trimmed.iloc[0:0].copy()
+        empty.insert(0, "Walk SKU", pd.Series(dtype=str))
+        return empty
+    out = trimmed.loc[keep_idx].copy()
+    out.insert(0, "Walk SKU", walk_skus)
+    return out.reset_index(drop=True)
+
+
 def bom_material_keys(bom: pd.DataFrame) -> tuple[set[str], set[str]]:
     """Child materials, and every material number that appears on the BOM."""
     if bom is None or bom.empty:
@@ -431,6 +482,20 @@ def bom_material_keys(bom: pd.DataFrame) -> tuple[set[str], set[str]]:
     children.discard("")
     parents.discard("")
     return children, children | parents
+
+
+def _walk_skus_by_child(bom: pd.DataFrame) -> dict[str, str]:
+    walk_col = _frame_column(bom, "Walk SKU")
+    child_col = _frame_column(bom, "Child Material")
+    if walk_col is None or child_col is None or bom is None or bom.empty:
+        return {}
+    found: dict[str, set[str]] = {}
+    for child, walk in zip(bom[child_col], bom[walk_col]):
+        key = clean_sap_key(child)
+        sku = clean_sap_key(walk)
+        if key and sku:
+            found.setdefault(key, set()).add(sku)
+    return {key: ", ".join(sorted(values)) for key, values in found.items()}
 
 
 def _qty(indexed: pd.DataFrame, material: str, column: str) -> float:
@@ -449,14 +514,24 @@ def compare_bom_stock(
     quantities = tool_quantities(stock, cogi, sto)
     indexed = quantities.set_index("Material") if not quantities.empty else quantities
     children, on_bom = bom_material_keys(bom)
+    parent_col = _frame_column(bom, "Parent Material")
+    immediate = set()
+    if parent_col is not None:
+        immediate = {clean_sap_key(value) for value in bom[parent_col]}
+        immediate.discard("")
+    leaves = children - immediate
+    if not leaves:
+        leaves = children
+    walk_for = _walk_skus_by_child(bom)
 
     missing_rows = []
-    for material in sorted(children):
+    for material in sorted(leaves):
         raw = _qty(indexed, material, "m002_raw")
         w004 = _qty(indexed, material, "w004_rm01")
         if raw <= 0 and w004 <= 0:
             missing_rows.append(
                 {
+                    "Walk SKU": walk_for.get(material, ""),
                     "Material": material,
                     "m002_raw": raw,
                     "w004_rm01": w004,
@@ -490,7 +565,7 @@ def compare_bom_stock(
         "quantities": quantities,
         "missing_unrestricted": pd.DataFrame(
             missing_rows,
-            columns=["Material", "m002_raw", "w004_rm01", "cogi", "open_sto"],
+            columns=["Walk SKU", "Material", "m002_raw", "w004_rm01", "cogi", "open_sto"],
         ),
         "stock_not_on_bom": pd.DataFrame(
             stock_rows, columns=["Material", "m002_raw", "w004_rm01"]
@@ -510,7 +585,7 @@ def _read_fixture(name: str) -> pd.DataFrame:
 
 def load_demo_feeds() -> PageFeeds:
     """Fixture BOM, stock, COGI, and open STO. Does not open Databricks."""
-    bom = bom_table(_read_fixture("live_bom_stock_bom.csv"))
+    bom = explode_walk_bom(bom_table(_read_fixture("live_bom_stock_bom.csv")))
     stock = _read_fixture("live_bom_stock_mard.csv")
     keep = [column for column in STOCK_COLUMNS if column in stock.columns]
     if keep != STOCK_COLUMNS:
@@ -539,9 +614,8 @@ def load_bom_frame(conn: Any, settings: DatabricksSettings) -> pd.DataFrame:
         stpo_cols,
         settings.stas_table,
         stas_cols,
-        parent_prefixes=WALK_PARENT_PREFIXES,
     )
-    return bom_table(bom_databricks._query(conn, sql))
+    return explode_walk_bom(bom_table(bom_databricks._query(conn, sql)))
 
 
 def load_stock_frame(conn: Any, tables: Sequence[str]) -> tuple[pd.DataFrame, str]:
