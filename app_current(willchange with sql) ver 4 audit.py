@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import html
 from io import BytesIO
 import json
 import math
@@ -8,13 +10,41 @@ import socket
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+import uuid
 
 import numpy as np
 import pandas as pd
 from playwright.sync_api import Page, sync_playwright
 import streamlit as st
-import hashlib
 
+from data_sources import (
+    SOURCE_DATABRICKS,
+    SOURCE_OPTIONS,
+    DatabricksSettings,
+    DatabricksSource,
+    DataSourceError,
+    SapUploadSource,
+    frame_fingerprint,
+)
+from picklist_drive import PICKLIST_SKIPPED, PicklistCopyResult, append_run_json
+from picklist_engine import (
+    StockBalances,
+    audit_decision,
+    clean_sap_key,
+    consolidate,
+    find_column_by_priority,
+    order_plan_sequences,
+    run_walk,
+)
+from walk_store import (
+    WALK_NEW,
+    WALK_REUSE,
+    claim_walk_run,
+    find_walk_run,
+    init_walk_tables,
+    load_walk_rows,
+    walk_action,
+)
 
 # ---------------------------------------------------------
 # PAGE CONFIGURATION
@@ -39,15 +69,69 @@ def find_local_file(candidates: List[str]) -> Optional[str]:
             return p
     return None
 
-LOCAL_BOM_PATH = find_local_file(["bom.csv", "BOM.csv", "BOM.CSV", "bom.xlsx", "BOM.xlsx","BOM_UPDATED_PRESERVE_ALL.csv"])
+LOCAL_BOM_PATH = find_local_file(["BOM_FINAL_EXPLODED (15th Oct).parquet"])
 LOCAL_LX02_PATH = find_local_file(["lx02.csv", "LX02.csv", "LX02.CSV", "lx02.xlsx", "LX02.xlsx", "lx02.xls", "LX02.xls", "LMAO - Data.csv"])
 LOCAL_STO_PATH = find_local_file(["sto.csv", "STO.csv", "open_sto.csv", "open_sto.xlsx", "sto.xlsx", "SIT sep 13 pm.xlsx"])
 
+@st.cache_data(show_spinner="⚡ Loading 400K BOM into RAM (takes < 1 sec)...")
+def get_master_bom_df() -> pd.DataFrame:
+    """Loads 400K BOM once into RAM and caches it. Sub-second subsequent loads."""
+    # 1. Check if user manually uploaded a BOM
+    if "uploaded_bom_df" in st.session_state and not st.session_state["uploaded_bom_df"].empty:
+        return st.session_state["uploaded_bom_df"]
+
+    # 2. Check local files
+    if not LOCAL_BOM_PATH or not os.path.exists(LOCAL_BOM_PATH):
+        return pd.DataFrame()
+
+    file_path = LOCAL_BOM_PATH
+    parquet_cache = os.path.join(BASE_DIR, "bom.parquet")
+
+    # Fast path: Parquet exists
+    if file_path.endswith(".parquet"):
+        return pd.read_parquet(file_path)
+    
+    # If parquet cache exists and is newer than the source file
+    if os.path.exists(parquet_cache) and os.path.getmtime(parquet_cache) >= os.path.getmtime(file_path):
+        return pd.read_parquet(parquet_cache)
+
+    # Fast path: CSV
+    if file_path.endswith(".csv"):
+        df = pd.read_csv(file_path, dtype=str, low_memory=False)
+        try:
+            df.to_parquet(parquet_cache, compression="snappy")
+        except Exception:
+            pass
+        return df
+
+    # Slow path: XLSX (Convert once to Parquet so it never lags again)
+    df = pd.read_excel(file_path, dtype=str)
+    try:
+        df.to_parquet(parquet_cache, compression="snappy")
+    except Exception:
+        pass
+    return df
+
 # ---------------------------------------------------------
-# LOCAL DATABASE INITIALIZATION (REFRESH-SAFE)
+# LOCAL DATABASE INITIALIZATION (REFRESH-SAFE & CONCURRENCY-SAFE)
 # ---------------------------------------------------------
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+def flush_db_to_disk():
+    """Forces SQLite to physically write all WAL buffer pages directly into loading_persistence.db"""
+    try:
+        with get_db_connection() as conn:
+            conn.execute("PRAGMA wal_checkpoint(FULL);")
+            conn.commit()
+    except Exception:
+        pass
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS truck_loading (
                 su_number TEXT PRIMARY KEY,
@@ -116,6 +200,9 @@ def init_db():
                 raw_json TEXT
             )
         """)
+        init_walk_tables(conn)
+
+init_db()
 
 def get_client_ip() -> str:
     try:
@@ -130,20 +217,24 @@ def get_client_ip() -> str:
     return "127.0.0.1"
 
 def get_scanned_records() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
-        return pd.read_sql("SELECT su_number, part_id, description, storage_bin, qty, status, remarks, scan_timestamp FROM truck_loading ORDER BY scan_timestamp DESC", conn)
+    with get_db_connection() as conn:
+        return pd.read_sql(
+            "SELECT su_number, part_id, description, storage_bin, qty, status, remarks, scan_timestamp FROM truck_loading ORDER BY scan_timestamp DESC",
+            conn
+        )
 
 def save_scanned_su(su: str, part: str, desc: str, bin_loc: str, qty: float):
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO truck_loading (su_number, part_id, description, storage_bin, qty, status, remarks)
             VALUES (?, ?, ?, ?, ?, 'LOADED', '')
         """, (su, part, desc, bin_loc, qty))
-        conn.commit()  # 👈 LOCK TO DISK
+        conn.commit()
 
 def clear_truck_ledger():
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db_connection() as conn:
         conn.execute("DELETE FROM truck_loading")
+        conn.commit()
 
 # ---------------------------------------------------------
 # ATHER BRANDING
@@ -177,10 +268,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# 1. OFFICIAL PSS MASTER (Complete & Uncut)
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# 1. OFFICIAL PSS MASTER (Consolidated & Complete Floor Truth)
+# 1. OFFICIAL PSS MASTER
 # ---------------------------------------------------------
 OFFICIAL_PSS_MASTER = {
     # --- Consolidated Ground-Truth Packaging Master ---
@@ -755,12 +843,10 @@ def get_official_pss(part_id: str, desc: str = "") -> Tuple[int, str]:
     if pid_raw in OFFICIAL_PSS_MASTER:
         return OFFICIAL_PSS_MASTER[pid_raw]
     
-    # Try normalized clean key match
     for master_k, (qty, ptype) in OFFICIAL_PSS_MASTER.items():
         if clean_sap_key(master_k) == pid_clean:
             return qty, ptype
 
-    # Intelligent fallback
     d = (desc or "").upper()
     if any(k in d for k in ["COVER", "FENDER", "PANEL", "FRAME", "LAMP", "SHROUD"]):
         return 60, "Pallet"
@@ -769,21 +855,8 @@ def get_official_pss(part_id: str, desc: str = "") -> Tuple[int, str]:
     
     return 60, "FLC"
 
-def find_column_by_priority(df: pd.DataFrame, candidates: List[str], exclude: List[str] = None) -> Optional[str]:
-    exclude = exclude or []
-    for cand in candidates:
-        for col in df.columns:
-            c_clean = str(col).strip().lower()
-            if cand in c_clean and not any(ex in c_clean for ex in exclude):
-                return col
-    return None
-
-def clean_sap_key(val: Any) -> str:
-    s = re.sub(r'[^A-Za-z0-9]', '', str(val)).upper()
-    return s.lstrip("0")
-
 # ---------------------------------------------------------
-# 2. BULLETPROOF LX02 PROCESSOR (MATCHED TO LMAO - DATA.CSV)
+# 2. BULLETPROOF LX02 PROCESSOR
 # ---------------------------------------------------------
 VALID_STORAGE_TYPES = ["HRR", "TSA", "IDP"]
 
@@ -851,8 +924,8 @@ def process_lx02_master(lx02_raw: pd.DataFrame) -> Tuple[Dict[str, str], Dict[st
     clean_df = clean_df[clean_df["SU_Qty"] > 0]
     clean_df = clean_df[clean_df["Stock_Category"].isin(["", "nan", "None"])]
 
-    # Returns location, description, and storage type maps
     return location_map, desc_map, type_map, clean_df
+
 # ---------------------------------------------------------
 # 3. SCALEX SCRAPER & FILE LOADER
 # ---------------------------------------------------------
@@ -956,30 +1029,20 @@ def fetch_all_scalex_data() -> pd.DataFrame:
     return combined_df
 
 def process_open_sto(sto_raw: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, str]]:
-    """
-    Parses Open Stock Transport Orders (W004 -> M002) with bulletproof column resolution.
-    Guarantees zero KeyError: None crashes.
-    """
     if sto_raw.empty:
         return {}, {}
 
     df = sto_raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Resolve Material Column
-    mat_col = find_column_by_priority(df, ["material", "matnr", "part", "item", "article"], exclude=["desc", "text", "unit"])
-    if not mat_col:
-        # Fallback to column 0 if material keyword not in header
-        mat_col = df.columns[0]
+    mat_col = find_column_by_priority(df, ["material", "matnr", "part", "item", "article"], exclude=["desc", "text", "unit"]) or df.columns[0]
 
-    # Resolve Quantity Column with broad STO keywords
     qty_col = find_column_by_priority(
         df, 
         ["quantity", "order quantity", "menge", "qty", "transit", "delivered", "scheduled", "open", "balance"],
         exclude=["unit", "price", "value", "amt", "currency"]
     )
 
-    # Fallback: if no qty column found by name, locate first numeric column
     if not qty_col:
         for c in df.columns:
             cleaned_series = pd.to_numeric(df[c].astype(str).str.replace(",", "").str.strip(), errors="coerce")
@@ -987,7 +1050,6 @@ def process_open_sto(sto_raw: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str,
                 qty_col = c
                 break
 
-    # If still not found, return empty gracefully without crashing
     if not qty_col or not mat_col:
         return {}, {}
 
@@ -995,7 +1057,6 @@ def process_open_sto(sto_raw: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str,
     plant_col = find_column_by_priority(df, ["plant", "receiving plant", "werks"], exclude=["supplying"])
     supp_col = find_column_by_priority(df, ["supplying plant", "reswk", "issuing"])
 
-    # Filter for W004 -> M002 if plant columns exist
     if supp_col and any("W004" in str(x).upper() for x in df[supp_col].dropna()):
         df = df[df[supp_col].astype(str).str.upper().str.contains("W004")]
     if plant_col and any("M002" in str(x).upper() for x in df[plant_col].dropna()):
@@ -1020,7 +1081,6 @@ def log_sap_upload(file_type: str, uploaded_file, df_loaded: pd.DataFrame):
     if df_loaded.empty or uploaded_file is None:
         return
     
-    # Calculate SHA256 of uploaded file
     try:
         uploaded_file.seek(0)
         file_bytes = uploaded_file.read()
@@ -1033,83 +1093,251 @@ def log_sap_upload(file_type: str, uploaded_file, df_loaded: pd.DataFrame):
     client_ip = get_client_ip()
     cols = ", ".join(list(df_loaded.columns))
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sap_upload_audit (
-                upload_id TEXT PRIMARY KEY,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                client_ip TEXT,
-                file_type TEXT,
-                file_name TEXT,
-                file_hash_sha256 TEXT,
-                rows_parsed INTEGER,
-                columns_detected TEXT
-            )
-        """)
+    with get_db_connection() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO sap_upload_audit 
             (upload_id, client_ip, file_type, file_name, file_hash_sha256, rows_parsed, columns_detected)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (upload_id, client_ip, file_type, getattr(uploaded_file, "name", "file"), file_hash, len(df_loaded), cols))
-        conn.commit() 
+        conn.commit()
+
+import io
+
+def locate_sap_header(raw_df: pd.DataFrame) -> pd.DataFrame:
+  """Universal SAP header finder for MB52, LX02, COGI, MB5T/STO, and BOM files.
+
+  Automatically strips title banners and detects header rows.
+  """
+  if raw_df is None or raw_df.empty:
+    return pd.DataFrame()
+
+  sap_keywords = {
+      # Universal / Materials
+      "material",
+      "matnr",
+      "child material",
+      "parent material",
+      "component",
+      "part id",
+      "part no",
+      "article",
+      # Inventory & Plant (MB52)
+      "plant",
+      "plnt",
+      "storage location",
+      "sloc",
+      "unrestricted",
+      "unrestricted-use stock",
+      "bun",
+      "base unit of measure",
+      # Warehouse Management (LX02)
+      "storage unit",
+      "storage bin",
+      "storage type",
+      "available stock",
+      "total stock",
+      # In-Transit & Orders (MB5T / STO)
+      "purchasing document",
+      "po number",
+      "receiving plant",
+      "supplying plant",
+      "transit",
+      "order quantity",
+      # COGI & Backflush
+      "error text",
+      "error message",
+      "movement type",
+      "posting date",
+      # Master BOM
+      "explosion level",
+      "comp qty",
+      "component description",
+  }
+
+  # 1. Check if row 0 is already the valid header
+  col_names = [
+      str(c).replace('"', '').replace("'", '').replace('\ufeff', '').strip()
+      for c in raw_df.columns
+  ]
+  col_lower = [c.lower() for c in col_names]
+  if any(any(k in c for k in sap_keywords) for c in col_lower):
+    result = raw_df.copy()
+    result.columns = col_names
+    return result.dropna(how='all').reset_index(drop=True)
+
+  # 2. Search through the first 40 rows to find where SAP table headers begin
+  for row_idx in range(min(40, len(raw_df))):
+    row_vals = [
+        str(val)
+        .replace('"', '')
+        .replace("'", '')
+        .replace('\ufeff', '')
+        .strip()
+        if pd.notna(val)
+        else ''
+        for val in raw_df.iloc[row_idx].tolist()
+    ]
+    row_lower = [v.lower() for v in row_vals]
+
+    # Count matching SAP column keywords in this row
+    matches = sum(
+        1
+        for v in row_lower
+        if any(k in v for k in sap_keywords) and len(v) < 45
+    )
+
+    if matches >= 2 or any(
+        m in row_lower
+        for m in [
+            'material',
+            'matnr',
+            'child material',
+            'parent material',
+            'purchasing document',
+        ]
+    ):
+      valid_cols = [
+          i
+          for i, v in enumerate(row_vals)
+          if v and v.lower() != 'nan' and not v.startswith('Unnamed')
+      ]
+      if not valid_cols:
+        valid_cols = list(range(len(row_vals)))
+
+      result = raw_df.iloc[row_idx + 1 :, valid_cols].copy()
+      result.columns = [row_vals[i] for i in valid_cols]
+
+      # Remove divider rows like |---|---|
+      if len(result.columns) > 0:
+        first_col = result.columns[0]
+        divider_mask = (
+            result[first_col]
+            .astype(str)
+            .str.strip()
+            .str.fullmatch(r'[-=+|]+', na=False)
+        )
+        result = result[~divider_mask]
+
+      return result.dropna(how='all').reset_index(drop=True)
+
+  return raw_df.dropna(how='all').reset_index(drop=True)
+  
 
 def load_uploaded_file(uploaded_file) -> pd.DataFrame:
-    if uploaded_file is None:
-        return pd.DataFrame()
-    
-    file_name = getattr(uploaded_file, "name", "").lower()
-    df = None
+  """Universal Ingestion Engine for CSV, TSV, Pipe-delimited, and Excel SAP dumps."""
+  if uploaded_file is None:
+    return pd.DataFrame()
 
-    # 1. Read Excel (.xlsx, .xls)
-    if file_name.endswith((".xlsx", ".xls")):
+  file_name = getattr(uploaded_file, 'name', 'file').lower()
+
+  try:
+    uploaded_file.seek(0)
+    raw_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+  except Exception as exc:
+    st.error(f"❌ Could not read '{file_name}': {exc}")
+    return pd.DataFrame()
+
+  if not raw_bytes:
+    st.error(f"❌ File '{file_name}' is empty.")
+    return pd.DataFrame()
+
+  df = None
+
+  # -------------------------------------------------------------
+  # 1. Native Excel (.xlsx, .xls)
+  # -------------------------------------------------------------
+  is_excel = (
+      raw_bytes.startswith(b'PK\x03\x04')
+      or raw_bytes.startswith(b'\xd0\xcf\x11\xe0')
+      or file_name.endswith(('.xlsx', '.xls'))
+  )
+
+  if is_excel:
+    try:
+      # Read first with default header
+      df_temp = pd.read_excel(io.BytesIO(raw_bytes), dtype=str)
+      df = locate_sap_header(df_temp)
+    except Exception:
+      try:
+        # Fallback reading with header=None
+        df_temp = pd.read_excel(io.BytesIO(raw_bytes), header=None, dtype=str)
+        df = locate_sap_header(df_temp)
+      except Exception:
+        df = None
+
+  # -------------------------------------------------------------
+  # 2. HTML / XML Table Export disguised as Excel/CSV
+  # -------------------------------------------------------------
+  if df is None or df.empty:
+    sample_head = raw_bytes[:2048].lower()
+    if (
+        b'<html' in sample_head
+        or b'<table' in sample_head
+        or b'<?xml' in sample_head
+    ):
+      for enc in ['utf-8', 'utf-16', 'cp1252', 'latin1']:
         try:
-            df = pd.read_excel(uploaded_file, dtype=str)
-        except Exception as e:
-            st.error(f"❌ Failed to parse Excel file '{file_name}': {e}")
-            return pd.DataFrame()
+          tables = pd.read_html(io.BytesIO(raw_bytes), encoding=enc)
+          for tbl in tables:
+            candidate = locate_sap_header(tbl)
+            if not candidate.empty:
+              df = candidate
+              break
+          if df is not None and not df.empty:
+            break
+        except Exception:
+          continue
 
-    # 2. Read CSV / TSV with Multi-Encoding Fallback
-    else:
-        for enc in ["utf-8", "latin1", "cp1252", "iso-8859-1"]:
-            for sep in [",", "\t", ";"]:
-                try:
-                    if hasattr(uploaded_file, "seek"):
-                        uploaded_file.seek(0)
-                    df = pd.read_csv(uploaded_file, dtype=str, sep=sep, encoding=enc)
-                    if df is not None and len(df.columns) > 1:
-                        break
-                except Exception:
-                    continue
-            if df is not None and len(df.columns) > 1:
-                break
+  # -------------------------------------------------------------
+  # 3. CSV / TSV / Pipe-Delimited text files
+  # -------------------------------------------------------------
+  if df is None or df.empty:
+    for enc in ['utf-8', 'utf-8-sig', 'latin1', 'cp1252', 'utf-16']:
+      try:
+        text = raw_bytes.decode(enc)
+      except Exception:
+        continue
 
-    if df is None or df.empty:
-        st.error(f"❌ File '{file_name}' was loaded but contains 0 rows.")
-        return pd.DataFrame()
+      # Try auto-detecting separator with python engine first
+      for sep in [None, ',', '\t', '|', ';']:
+        try:
+          candidate = pd.read_csv(
+              io.StringIO(text),
+              sep=sep,
+              engine='python' if sep is None else 'c',
+              dtype=str,
+              on_bad_lines='skip',
+          )
+          candidate = candidate.loc[
+              :, ~candidate.columns.astype(str).str.contains(r'^Unnamed')
+          ]
+          parsed = locate_sap_header(candidate)
+          if not parsed.empty and len(parsed.columns) > 1:
+            df = parsed
+            break
+        except Exception:
+          continue
+      if df is not None and not df.empty:
+        break
 
-    # ---------------------------------------------------------
-    # SMART SAP HEADER DETECTOR (WORKS FOR MB52, LX02, BOM, STO)
-    # ---------------------------------------------------------
-    # Checks if headers are already clean
-    cols_clean = [str(c).strip().lower() for c in df.columns]
-    has_valid_header = any(k in cols_clean for k in ["material", "matnr", "child material", "part id"])
+  # -------------------------------------------------------------
+  # 4. Final Validation & Cleanup
+  # -------------------------------------------------------------
+  if df is None or df.empty:
+    st.error(
+        f"❌ File '{file_name}' contains no parseable table. The SAP column"
+        ' header could not be located.'
+    )
+    return pd.DataFrame()
 
-    # If top rows contain SAP title metadata, find the real header row
-    if not has_valid_header:
-        for i in range(min(15, len(df))):
-            row_vals = [str(x).strip().lower() for x in df.iloc[i].values]
-            
-            # Universal match: Any row that has a Material column + a Location, Plant, or Qty column
-            has_mat = any("material" in v or "matnr" in v or "part" in v for v in row_vals)
-            has_secondary = any(k in row_vals for k in ["plant", "plnt", "unrestricted", "storage bin", "storage location", "available stock", "comp qty"])
-            
-            if has_mat and has_secondary:
-                df.columns = [str(x).strip() for x in df.iloc[i].values]
-                df = df.iloc[i+1:].reset_index(drop=True)
-                break
+  df.columns = [
+      str(c).replace('\ufeff', '').replace('"', '').replace("'", '').strip()
+      for c in df.columns
+  ]
+  return df.dropna(how='all').reset_index(drop=True)
 
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+
 def check_hold_to_plan_transitions(current_batches: pd.DataFrame) -> List[str]:
     current_state = {}
     for _, b in current_batches.iterrows():
@@ -1152,7 +1380,6 @@ def check_hold_to_plan_transitions(current_batches: pd.DataFrame) -> List[str]:
 def build_description_map(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame, bom_df: pd.DataFrame) -> Dict[str, str]:
     desc_map = {}
     
-    # 1. BOM (Fallback)
     if not bom_df.empty:
         df = bom_df.copy()
         df.columns = [str(c).strip() for c in df.columns]
@@ -1166,7 +1393,6 @@ def build_description_map(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame, bom_df: 
                     desc_map[m] = d
                     desc_map[m.lstrip("0")] = d
 
-    # 2. MB52
     if not mb52_df.empty:
         df = mb52_df.copy()
         df.columns = [str(c).strip() for c in df.columns]
@@ -1180,7 +1406,6 @@ def build_description_map(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame, bom_df: 
                     desc_map[m] = d
                     desc_map[m.lstrip("0")] = d
 
-    # 3. LX02 (Primary Source)
     if not lx02_df.empty:
         df = lx02_df.copy()
         df.columns = [str(c).strip() for c in df.columns]
@@ -1203,19 +1428,11 @@ def resolve_dispatch_sequences(
     l1_start: int = 1,
     l2_start: int = 1
 ) -> Tuple[Set[str], Set[str]]:
-    """
-    Calculates active 'Line#Seq' keys based on Target Production Qty (minutes/units)
-    or manual sequence entry.
-    Returns:
-        active_keys: set of 'Line#Seq' strings included in the picklist
-        cutoff_keys: set of 'Line#Seq' strings that mark the final cutoff sequence
-    """
     active_keys = set()
     cutoff_keys = set()
 
     plan_df = batches_df[batches_df["Status"] == "PLAN"].copy()
 
-    # Case A: User entered a Target Production Qty (e.g. 180 or 240)
     if target_units and target_units > 0:
         for line_name, start_seq in [("Line_1", l1_start), ("Line_2", l2_start)]:
             line_batches = plan_df[
@@ -1240,12 +1457,10 @@ def resolve_dispatch_sequences(
             if last_key:
                 cutoff_keys.add(last_key)
 
-    # Case B: User manually selected sequences
     elif manual_seq_list:
         for _, b in plan_df[plan_df["ScaleX_Sequence_No"].isin(manual_seq_list)].iterrows():
             active_keys.add(f"{b['Line']}#{int(b['ScaleX_Sequence_No'])}")
 
-    # Case C: All sequences
     else:
         for _, b in plan_df.iterrows():
             active_keys.add(f"{b['Line']}#{int(b['ScaleX_Sequence_No'])}")
@@ -1256,10 +1471,9 @@ AUDIT_VAULT_DIR = os.path.join(BASE_DIR, "audit_vault")
 os.makedirs(os.path.join(AUDIT_VAULT_DIR, "runs_csv"), exist_ok=True)
 os.makedirs(os.path.join(AUDIT_VAULT_DIR, "runs_json"), exist_ok=True)
 
-
-def record_audit_run(run_id: str, audit_records: List[dict]):
+def record_audit_run(run_id: str, audit_records: List[dict]) -> Optional[PicklistCopyResult]:
     if not audit_records:
-        return
+        return None
 
     df_run = pd.DataFrame(audit_records)
 
@@ -1272,37 +1486,69 @@ def record_audit_run(run_id: str, audit_records: List[dict]):
     with open(json_path, "w") as f:
         json.dump(audit_records, f, indent=2)
 
-    # 3. Write to SQLite
-    with sqlite3.connect(DB_PATH) as conn:
+    # 3. Write directly to SQLite and physically commit
+    with get_db_connection() as conn:
         df_run.to_sql("material_decision_audit", conn, if_exists="append", index=False)
-        conn.commit()  # 👈 LOCK TO DISK
+        conn.commit()
 
-def extract_detailed_stock_maps(mb52_df: pd.DataFrame):
-    if mb52_df.empty:
+    # Flush WAL memory buffer straight into disk file
+    flush_db_to_disk()
+
+    # 4. Append this JSON into the Drive desktop folder. drive_export.export_run_json
+    # stays in the repo but is not called: it would replace picklist.csv through the
+    # Drive API and upload the same file a second time. Filter changes never reach here.
+    return append_run_json(json_path)
+
+def extract_detailed_stock_maps(mb52_df: pd.DataFrame, lx02_df: pd.DataFrame = None):
+    if mb52_df.empty and (lx02_df is None or lx02_df.empty):
         return {}, {}, {}, {}, {}
 
-    mb = mb52_df.copy()
-    mb.columns = [str(c).strip() for c in mb.columns]
-    
-    mat_col = find_column_by_priority(mb, ["material", "matnr", "part"]) or mb.columns[0]
-    plant_col = find_column_by_priority(mb, ["plant", "plnt", "werks"]) or "Plant"
-    sloc_col = find_column_by_priority(mb, ["storage location", "sloc", "lgort"]) or "Storage Location"
-    qty_col = find_column_by_priority(mb, ["unrestricted", "available", "stock", "labst"]) or mb.columns[-1]
+    m002_rm01, m002_ps01, m002_pv01, w004_rm01, w004_total = {}, {}, {}, {}, {}
 
-    mb["Mat_Clean"] = mb[mat_col].apply(clean_sap_key)
-    mb["Plant_Clean"] = mb[plant_col].astype(str).str.strip().str.upper()
-    mb["SLoc_Clean"] = mb[sloc_col].astype(str).str.strip().str.upper()
-    mb["Clean_Qty"] = pd.to_numeric(mb[qty_col].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
+    if not mb52_df.empty:
+        mb = mb52_df.copy()
+        mb.columns = [str(c).strip() for c in mb.columns]
 
-    # Distinct mappings by specific SLoc
-    m002_rm01 = mb[(mb["Plant_Clean"].str.contains("M002")) & (mb["SLoc_Clean"] == "RM01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
-    m002_ps01 = mb[(mb["Plant_Clean"].str.contains("M002")) & (mb["SLoc_Clean"] == "PS01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
-    m002_pv01 = mb[(mb["Plant_Clean"].str.contains("M002")) & (mb["SLoc_Clean"] == "PV01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
-    w004_rm01 = mb[(mb["Plant_Clean"].str.contains("W004")) & (mb["SLoc_Clean"] == "RM01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
-    w004_total = mb[mb["Plant_Clean"].str.contains("W004")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+        mat_col = find_column_by_priority(mb, ["material", "matnr", "part"], exclude=["desc", "text"]) or mb.columns[0]
+        plant_col = find_column_by_priority(mb, ["plant", "plnt", "werks"], exclude=["desc", "text", "name"]) or "Plant"
+        sloc_col = find_column_by_priority(mb, ["storage location", "sloc", "lgort"], exclude=["desc", "text", "name"]) or "Storage Location"
+        qty_col = find_column_by_priority(mb, ["unrestricted", "available", "stock", "labst"], exclude=["val", "value", "price"]) or mb.columns[-1]
+
+        mb["Mat_Clean"] = mb[mat_col].apply(clean_sap_key)
+        mb["Plant_Clean"] = mb[plant_col].astype(str).str.strip().str.upper()
+        mb["SLoc_Clean"] = mb[sloc_col].astype(str).str.strip().str.upper()
+        mb["Clean_Qty"] = pd.to_numeric(mb[qty_col].astype(str).str.replace(",", "").str.strip(), errors="coerce").fillna(0.0)
+
+        m002_mask = mb["Plant_Clean"].str.contains("M002")
+        w004_mask = mb["Plant_Clean"].str.contains("W004")
+
+        m002_rm01 = mb[m002_mask & mb["SLoc_Clean"].str.contains("RM01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+        m002_ps01 = mb[m002_mask & mb["SLoc_Clean"].str.contains("PS01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+        m002_pv01 = mb[m002_mask & mb["SLoc_Clean"].str.contains("PV01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+
+        # Matches "RM01" or "RM01 G Stock Store"
+        w004_rm01 = mb[w004_mask & mb["SLoc_Clean"].str.contains("RM01")].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+        w004_total = mb[w004_mask].groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+
+    # Fallback to LX02 if MB52 has 0
+    if lx02_df is not None and not lx02_df.empty:
+        lx = lx02_df.copy()
+        lx_mat_col = find_column_by_priority(lx, ["material", "matnr"], exclude=["desc", "text"])
+        lx_qty_col = find_column_by_priority(lx, ["available stock", "verme", "unrestricted", "available", "total stock"])
+        
+        if lx_mat_col and lx_qty_col:
+            lx["Mat_Clean"] = lx[lx_mat_col].apply(clean_sap_key)
+            lx["Clean_Qty"] = pd.to_numeric(lx[lx_qty_col].astype(str).str.replace(",", ""), errors="coerce").fillna(0.0)
+            lx_stock_map = lx.groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
+
+            for mat, q in lx_stock_map.items():
+                if w004_rm01.get(mat, 0) == 0:
+                    w004_rm01[mat] = q
+                if w004_total.get(mat, 0) == 0:
+                    w004_total[mat] = q
 
     return m002_rm01, m002_ps01, m002_pv01, w004_rm01, w004_total
-
+   
 def classify_material_decision(
     demand: float,
     m002_avail: float,
@@ -1314,9 +1560,6 @@ def classify_material_decision(
     unit_usage: float,
     safety_buffer_mins: int = 30
 ) -> Tuple[str, str, str, float]:
-    """
-    Returns: (picklist_status, decision_code, decision_reason, demand_to_fulfil)
-    """
     if is_hold_batch:
         return "REJECTED", "REJECTED_HOLD_SEQUENCE", "Batch is on HOLD in ScaleX plan.", 0.0
 
@@ -1336,7 +1579,6 @@ def classify_material_decision(
     if projected_balance >= safety_buffer_units:
         return "REJECTED", "REJECTED_SUFFICIENT_M002", f"M002 floor stock ({m002_avail}) covers demand + >30m buffer.", 0.0
 
-    # Net deficit exists
     if projected_balance <= 0:
         net_demand = abs(projected_balance) + safety_buffer_units
         code = "ACCEPTED_DEFICIT_FULFILLED"
@@ -1346,13 +1588,31 @@ def classify_material_decision(
         code = "ACCEPTED_PREEMPTIVE_BUFFER"
         status_prefix = f"Runway pierced below {safety_buffer_mins}m buffer."
 
-    # Check warehouse stock
     if w004_stock <= 0:
         if pv01_stock > 0 and m002_avail <= 0:
             return "REJECTED", "REJECTED_PV01_NON_USABLE", f"W004 RM01 has 0 stock. Stock exists in PV01 ({pv01_stock}) but is unusable.", 0.0
         return "REJECTED", "REJECTED_W004_STOCKOUT", f"Deficit of {net_demand} exists, but W004 RM01 stock is 0.", 0.0
 
     return "INCLUDED", code, f"{status_prefix} Available in W004 RM01 ({w004_stock} on hand).", net_demand
+
+def process_cogi_dump(cogi_df: pd.DataFrame) -> Dict[str, float]:
+    if cogi_df is None or cogi_df.empty:
+        return {}
+    
+    df = cogi_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    
+    mat_col = find_column_by_priority(df, ["material", "matnr", "part"]) or df.columns[1]
+    qty_col = find_column_by_priority(df, ["qty in unit of entry", "quantity", "qty", "entry qty", "menge"]) or df.columns[7]
+    plant_col = find_column_by_priority(df, ["plant", "werks"])
+    
+    df["Mat_Clean"] = df[mat_col].apply(clean_sap_key)
+    df["Clean_Qty"] = pd.to_numeric(df[qty_col].astype(str).str.replace(",", "").str.strip(), errors="coerce").fillna(0.0)
+    
+    if plant_col:
+        df = df[df[plant_col].astype(str).str.upper().str.contains("M002")]
+        
+    return df.groupby("Mat_Clean")["Clean_Qty"].sum().to_dict()
 
 def calculate_band2_and_pss_engine(
     batches_df: pd.DataFrame,
@@ -1364,13 +1624,9 @@ def calculate_band2_and_pss_engine(
     active_seq_keys: Set[str],
     calc_formula_mode: str = "Standard Net Deficit"
 ) -> pd.DataFrame:
-    # 1. Ingest BOM
-    if "uploaded_bom_df" in st.session_state and not st.session_state["uploaded_bom_df"].empty:
-        bom_df = st.session_state["uploaded_bom_df"].copy()
-    elif LOCAL_BOM_PATH and os.path.exists(LOCAL_BOM_PATH):
-        bom_df = pd.read_csv(LOCAL_BOM_PATH, dtype=str) if LOCAL_BOM_PATH.endswith(".csv") else pd.read_excel(LOCAL_BOM_PATH, dtype=str)
-    else:
-        st.error("🚨 BOM file (`bom.csv`) not found. Upload it in the sidebar.")
+    bom_df = get_master_bom_df()
+    if bom_df.empty:
+        st.error("🚨 BOM file not found. Upload it in the sidebar.")
         return pd.DataFrame()
 
     plan_batches = batches_df[batches_df["Status"] == "PLAN"].copy()
@@ -1381,7 +1637,6 @@ def calculate_band2_and_pss_engine(
         st.warning("⚠️ No active PLAN batches match the line filter.")
         return pd.DataFrame()
 
-    # Clean BOM headers
     bom_clean = bom_df.copy()
     bom_clean.columns = [str(c).strip() for c in bom_clean.columns]
     parent_col = find_column_by_priority(bom_clean, ["parent material", "parent", "sku", "vehicle"]) or "Parent Material"
@@ -1389,16 +1644,49 @@ def calculate_band2_and_pss_engine(
     qty_col = find_column_by_priority(bom_clean, ["comp qty", "quantity", "qty", "menge"]) or "Comp Qty."
     desc_col = find_column_by_priority(bom_clean, ["component description", "material description", "description"]) or "Description"
 
-    bom_clean["Parent_Clean"] = bom_clean[parent_col].astype(str).str.strip().str.upper()
+    bom_clean["Parent_Clean"] = bom_clean[parent_col].apply(clean_sap_key)
+    bom_clean["Child_Clean"] = bom_clean[child_col].apply(clean_sap_key)
     bom_clean["Clean_Qty"] = pd.to_numeric(
         bom_clean[qty_col].astype(str).str.replace(",", "").str.strip(), errors="coerce"
     ).fillna(0.0)
 
-    # 2. SEPARATE BATCHES: Preceding Conveyor Batches vs. Target Dispatch Batches
-    # This prevents the line loss by calculating what earlier batches will consume!
+    # Pre-index BOM hierarchy into dictionary for high-performance recursion
+    bom_lookup: Dict[str, List[dict]] = {}
+    for parent_k, grp in bom_clean.groupby("Parent_Clean"):
+        bom_lookup[parent_k] = grp[[child_col, "Child_Clean", desc_col, "Clean_Qty"]].to_dict(orient="records")
+
+    def get_all_child_components(parent_key: str, current_qty: float = 1.0, visited=None) -> List[dict]:
+        if visited is None:
+            visited = set()
+        if parent_key in visited:
+            return []
+        visited.add(parent_key)
+
+        direct_children = bom_lookup.get(parent_key, [])
+        if not direct_children:
+            return []
+
+        expanded = []
+        for comp in direct_children:
+            c_mat = comp[child_col]
+            c_clean = comp["Child_Clean"]
+            tot_qty = comp["Clean_Qty"] * current_qty
+            
+            # 💡 FIX: If the component is a recognized warehouse handling unit (in PSS master)
+            # or is a direct plant component, DO NOT dissolve it into sub-parts!
+            is_handled_unit = (c_mat in OFFICIAL_PSS_MASTER) or (c_clean in OFFICIAL_PSS_MASTER)
+            
+            if c_clean in bom_lookup and not is_handled_unit:
+                expanded.extend(get_all_child_components(c_clean, tot_qty, visited.copy()))
+            else:
+                expanded.append({
+                    "Child Material": c_mat,
+                    "Description": str(comp.get(desc_col, "")).strip(),
+                    "Unit_Qty": tot_qty
+                })
+        return expanded
+
     plan_batches["Line_Seq_Key"] = plan_batches["Line"] + "#" + plan_batches["ScaleX_Sequence_No"].astype(str)
-    
-    # Identify the earliest sequence being targeted in this wave
     target_batches = plan_batches[plan_batches["Line_Seq_Key"].isin(active_seq_keys)].copy() if active_seq_keys else plan_batches.copy()
     if target_batches.empty:
         st.warning("⚠️ No batches selected in the dispatch horizon.")
@@ -1406,42 +1694,40 @@ def calculate_band2_and_pss_engine(
 
     earliest_target_seq = target_batches["ScaleX_Sequence_No"].min()
     
-    # Preceding batches running on the line that haven't backflushed yet
     preceding_batches = plan_batches[
         (plan_batches["ScaleX_Sequence_No"] < earliest_target_seq) &
         (plan_batches["ScaleX_Sequence_No"] >= st.session_state.get("current_running_seq_l1", 1))
     ].copy()
 
-    # 3. Calculate Preceding Consumption (What Seq 1–3 will eat)
     preceding_drain = {}
     for _, pb in preceding_batches.iterrows():
-        p_sku = str(pb["SKUName"]).strip().upper()
+        p_sku = clean_sap_key(pb["SKUName"])
         p_count = int(pb["Count"])
-        sku_bom = bom_clean[bom_clean["Parent_Clean"] == p_sku]
-        for _, comp in sku_bom.iterrows():
-            c_mat = clean_sap_key(comp[child_col])
-            preceding_drain[c_mat] = preceding_drain.get(c_mat, 0.0) + (comp["Clean_Qty"] * p_count)
+        comps = get_all_child_components(p_sku, 1.0)
+        for comp in comps:
+            c_mat = clean_sap_key(comp["Child Material"])
+            preceding_drain[c_mat] = preceding_drain.get(c_mat, 0.0) + (comp["Unit_Qty"] * p_count)
 
-    # 4. Explode Target Wave Batches (What Seq 4–7 needs)
     sequence_rows = []
     line_offsets = {"line_1": 0, "line_2": 0}
     for _, batch in target_batches.sort_values(by=["Line", "ScaleX_Sequence_No"]).iterrows():
-        sku = str(batch["SKUName"]).strip().upper()
+        sku_raw = str(batch["SKUName"]).strip().upper()
+        p_sku = clean_sap_key(sku_raw)
         line = batch["Line"]
         seq_no = int(batch["ScaleX_Sequence_No"])
         count = int(batch["Count"])
         start_min = line_offsets.get(line.lower(), 0)
         line_offsets[line.lower()] = start_min + count
 
-        sku_bom = bom_clean[bom_clean["Parent_Clean"] == sku]
-        for _, comp in sku_bom.iterrows():
+        comps = get_all_child_components(p_sku, 1.0)
+        for comp in comps:
             sequence_rows.append({
                 "Line": line,
                 "Sequence_Order": seq_no,
-                "Vehicle_SKU": sku,
-                "Child Material": str(comp[child_col]).strip(),
-                "Description": str(comp[desc_col]).strip() if desc_col in comp else "",
-                "Required_Qty": comp["Clean_Qty"] * count,
+                "Vehicle_SKU": sku_raw,
+                "Child Material": comp["Child Material"],
+                "Description": comp["Description"],
+                "Required_Qty": comp["Unit_Qty"] * count,
                 "Minute_Offset": start_min,
             })
 
@@ -1452,7 +1738,6 @@ def calculate_band2_and_pss_engine(
     lx02_in = st.session_state.get("lx02_df", pd.DataFrame())
     desc_map = build_description_map(mb52_df, lx02_in, bom_clean)
 
-    # Group Target Demand
     grouped = []
     for child_mat, grp in df_seq.groupby("Child Material"):
         earliest_min = int(grp["Minute_Offset"].min())
@@ -1473,53 +1758,61 @@ def calculate_band2_and_pss_engine(
         })
     aggregated = pd.DataFrame(grouped)
 
-    # Ingest SLocs from MB52
-    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, _ = extract_detailed_stock_maps(mb52_df)
+    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = extract_detailed_stock_maps(mb52_df, lx02_in)
+    cogi_map = process_cogi_dump(cogi_df)
     sto_qty_dict, sto_po_dict = process_open_sto(sto_df)
 
     final_records = []
+    # 2. Inside the loop over aggregated parts:
     for _, r in aggregated.iterrows():
         part_id = r["Child Material"]
-        clean_pid = clean_sap_key(part_id)
+        clean_pid = clean_sap_key(part_id)      # 👈 clean_pid is defined here!
         req = int(r["Total_Demand"])
 
         m002_raw = m002_rm01_map.get(clean_pid, 0.0) + m002_ps01_map.get(clean_pid, 0.0)
-        cogi_qty = 0 # Handled in effective
-        w004 = int(w004_rm01_map.get(clean_pid, 0.0))
+        cogi_qty = int(cogi_map.get(clean_pid, 0.0))
+        
+        # 👈 Put this line HERE, indented inside the loop:
+        w004 = int(w004_rm01_map.get(clean_pid, w004_tot_map.get(clean_pid, 0.0)))
+        
         open_sto = int(sto_qty_dict.get(clean_pid, 0))
         open_pos = sto_po_dict.get(clean_pid, "")
 
-        # 🎯 CRITICAL FIX: DEDUCT PRECEDING ACTIVE UN-BACKFLUSHED DEMAND!
+        effective_m002 = max(0.0, m002_raw - cogi_qty)
         prior_drain = preceding_drain.get(clean_pid, 0.0)
-        true_m002_available = max(0.0, m002_raw - prior_drain)
+        preceding_balance = effective_m002 - prior_drain
+        
+        if preceding_balance < 0:
+            preceding_starvation_deficit = abs(preceding_balance)
+            usable_floor_for_target = 0.0
+        else:
+            preceding_starvation_deficit = 0.0
+            usable_floor_for_target = preceding_balance
 
-        total_pipeline = true_m002_available + open_sto
-        demand_to_fulfil = max(0, int(req - total_pipeline))
+        gross_deficit = preceding_starvation_deficit + req
+        demand_to_fulfil = max(0, int(gross_deficit - open_sto - usable_floor_for_target))
+        total_pipeline = max(0.0, usable_floor_for_target + open_sto)
+
 
         box_size, p_type = get_official_pss(part_id, r["Description"])
 
-        # 🎯 CASE LOGIC: WHITE, YELLOW, RED (TRIGGER STILL SENT)
         if demand_to_fulfil > 0:
             ideal_pss_count = math.ceil(demand_to_fulfil / box_size)
             ideal_pick_qty = ideal_pss_count * box_size
 
             if w004 >= demand_to_fulfil:
-                # 🟢 CASE 2: White / Green
                 actual_need_pick = ideal_pick_qty
                 actual_pss_count = ideal_pss_count
                 transfer_status = "Ready for Full Transfer"
             elif w004 > 0:
-                # 🟡 CASE 3: Yellow (Partial Pick)
                 actual_need_pick = w004
                 actual_pss_count = math.ceil(actual_need_pick / box_size)
                 transfer_status = "Partial Transfer Available"
             else:
-                # 🔴 CASE 4: Red (W004 == 0 -> Send Trigger Anyway!)
                 actual_need_pick = ideal_pick_qty
                 actual_pss_count = ideal_pss_count
                 transfer_status = "W004 Out of Stock (0 Available - Trigger Sent)"
         else:
-            # ⚪ CASE 1: No Pick Needed
             actual_need_pick = 0
             actual_pss_count = 0
             transfer_status = "Sufficient M002 Stock"
@@ -1536,7 +1829,7 @@ def calculate_band2_and_pss_engine(
             "To be picked PSS count": actual_pss_count,
             "W004 Stock": w004,
             "M002 Stock": int(m002_raw),
-            "COGI Qty": int(cogi_qty),
+            "COGI Qty": cogi_qty,
             "Open STO In-Transit": open_sto,
             "Open PO Numbers": open_pos,
             "Total M002 Pipeline": int(total_pipeline),
@@ -1550,22 +1843,6 @@ def calculate_band2_and_pss_engine(
         })
 
     return pd.DataFrame(final_records)
-# ---------------------------------------------------------
-# 5. UI CONTROLS & TIMED REFRESH
-# ---------------------------------------------------------
-st.markdown("""
-<div class="ather-header">
-    <div style="display: flex; justify-content: space-between; align-items: center;">
-        <div>
-            <span style="font-size: 24px; font-weight: 900; color: #00c853; letter-spacing: 1px;">⚡ ATHER</span>
-            <span style="font-size: 18px; font-weight: 700; color: #0f172a; margin-left: 10px;">| 1-Min Takt Replenishment & PSS Kitting Suite</span>
-        </div>
-        <span style="font-size: 12px; font-weight: bold; background: #e8f5e9; color: #1b5e20; padding: 4px 12px; border-radius: 20px;">
-            ● Dual-Line Simultaneous Execution
-        </span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------
 # SIDEBAR FILTERS & DATA INGESTION
@@ -1590,7 +1867,6 @@ auto_sync_enabled = st.sidebar.checkbox("Enable 10-Min Auto-Sync", value=True)
 
 if auto_sync_enabled and time_elapsed >= 600:
     st.session_state["last_sync_timestamp"] = time.time()
-    # Runs quietly in background without forcing a full screen reload
     res = fetch_all_scalex_data()
     if not res.empty:
         st.session_state["batches"] = res
@@ -1614,12 +1890,26 @@ if st.sidebar.button("🧹 Clear SAP Cache"):
     st.session_state.pop("cogi_df", None)
     st.session_state.pop("lx02_df", None)
     st.session_state.pop("sto_df", None)
+    st.session_state.pop("cached_master_df", None)
     st.sidebar.success("Cache cleared!")
 
 st.sidebar.divider()
 st.sidebar.subheader("📂 Upload SAP Dumps")
-st.sidebar.divider()
-st.sidebar.subheader("📂 Upload SAP Dumps")
+
+def read_databricks_secrets() -> dict:
+    try:
+        return dict(st.secrets.get("databricks", {}))
+    except Exception:
+        return {}
+
+stock_source_choice = st.sidebar.selectbox("SAP Stock Source:", SOURCE_OPTIONS, index=0)
+databricks_settings = DatabricksSettings.resolve(read_databricks_secrets())
+if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is None:
+    st.sidebar.warning(
+        "⚠️ Databricks not configured (missing "
+        + ", ".join(DatabricksSettings.missing(read_databricks_secrets()))
+        + "). Using SAP uploads."
+    )
 
 uploaded_mb52 = st.sidebar.file_uploader("Upload MB52 Stock", type=["csv", "xlsx", "xls"], key="uploader_mb52_stock")
 if uploaded_mb52 is not None:
@@ -1653,7 +1943,7 @@ if uploaded_sto is not None:
         log_sap_upload("MB5T", uploaded_sto, loaded_sto)
         st.sidebar.success(f"✅ MB5T (STO) Loaded: **{len(loaded_sto)} rows**")
 
-uploaded_bom = st.sidebar.file_uploader("Upload `bom.csv`", type=["csv", "xlsx"])
+uploaded_bom = st.sidebar.file_uploader("Upload bom.csv / xlsx", type=["csv", "xlsx"])
 if uploaded_bom is not None:
     loaded_bom = load_uploaded_file(uploaded_bom)
     if not loaded_bom.empty:
@@ -1661,7 +1951,7 @@ if uploaded_bom is not None:
         log_sap_upload("BOM", uploaded_bom, loaded_bom)
         st.sidebar.success(f"✅ BOM Loaded: **{len(loaded_bom)} rows**")
 
-uploaded_plan = st.sidebar.file_uploader("Upload `plan_batches.csv` (If offline)", type=["csv"])
+uploaded_plan = st.sidebar.file_uploader("Upload plan_batches.csv (If offline)", type=["csv"])
 if uploaded_plan:
     st.session_state["batches"] = pd.read_csv(uploaded_plan)
     st.sidebar.success("Manual Plan Loaded!")
@@ -1690,13 +1980,11 @@ if "Line" not in batches_df.columns:
     batches_df["Line"] = "Line_1"
 
 batches_df["Status"] = batches_df["Status"].astype(str).str.strip().str.upper()
-
-# Assign Sequence Numbers ONLY to active PLAN batches
 batches_df["ScaleX_Sequence_No"] = batches_df[batches_df["Status"] == "PLAN"].groupby("Line", sort=False).cumcount() + 1
 batches_df["ScaleX_Sequence_No"] = batches_df["ScaleX_Sequence_No"].fillna(0).astype(int)
 
 # ---------------------------------------------------------
-# CLIENT-SIDE LIVE TAKT MONITOR (ZERO SCREEN REFRESH)
+# CLIENT-SIDE LIVE TAKT MONITOR
 # ---------------------------------------------------------
 if "current_running_seq_l1" not in st.session_state:
     st.session_state["current_running_seq_l1"] = 1
@@ -1726,7 +2014,6 @@ with col_adv2:
         st.session_state["current_running_seq_l2"] += 1
         st.rerun()
 
-# Check if browser triggered an automatic batch advance
 query_params = st.query_params
 if "advance_line" in query_params:
     adv_line = query_params["advance_line"]
@@ -1740,6 +2027,16 @@ if "advance_line" in query_params:
     del st.query_params["advance_line"]
     st.rerun()
 
+def apply_band2_row_styles(row):
+    status_str = str(row.get("Transfer Status", row.get("Status", "")))
+
+    if "Out of Stock" in status_str:
+        return ["background-color: #fee2e2; color: #991b1b; font-weight: bold;"] * len(row)
+    elif "Partial" in status_str:
+        return ["background-color: #fef9c3; color: #854d0e; font-weight: bold;"] * len(row)
+    elif "Ready" in status_str:
+        return ["background-color: #dcfce7; color: #166534; font-weight: bold;"] * len(row)
+    return ["background-color: #ffffff; color: #0f172a;"] * len(row)
 
 takt_banner_html = f"""
 <!DOCTYPE html>
@@ -1759,39 +2056,30 @@ takt_banner_html = f"""
         .progress-bar-fill {{ height: 100%; width: 0%; background: #00c853; transition: width 1s linear; }}
         .timer-badge {{ font-size: 11px; font-weight: 800; color: #0369a1; background: #e0f2fe; padding: 2px 8px; border-radius: 10px; display: inline-block; margin-top: 4px; }}
         .complete-badge {{ display: none; font-size: 11px; font-weight: 900; background: #dcfce7; color: #15803d; padding: 2px 6px; border-radius: 6px; }}
-        .pulse {{ animation: alertPulse 1.5s infinite; }}
-        @keyframes alertPulse {{
-            0% {{ box-shadow: 0 0 0 0 rgba(0, 200, 83, 0.4); }}
-            70% {{ box-shadow: 0 0 0 10px rgba(0, 200, 83, 0); }}
-            100% {{ box-shadow: 0 0 0 0 rgba(0, 200, 83, 0); }}
-        }}
     </style>
 </head>
 <body>
     <div class="takt-container" id="taktContainer">
-        <!-- LINE 1 MONITOR -->
         <div class="takt-card">
             <div class="takt-title">🏍️ Line 1 Conveyor Takt</div>
             <div class="takt-val">
-                <span id="l1_base_text">Seq #{l1_curr} ({l1_sku})</span>
+                <span id="l1_base_text">Seq #{l1_curr} ({html.escape(l1_sku)})</span>
                 <span id="l1_badge" class="complete-badge">🏁 BATCH FINISHED</span>
             </div>
             <div class="progress-bar-bg"><div class="progress-bar-fill" id="l1_prog"></div></div>
             <div class="timer-badge" id="l1_timer">⏱️ Next Batch in: calculating...</div>
         </div>
 
-        <!-- LINE 2 MONITOR -->
         <div class="takt-card" style="border-left-color: #0284c7;">
             <div class="takt-title" style="color: #0369a1;">🛵 Line 2 Conveyor Takt</div>
             <div class="takt-val">
-                <span id="l2_base_text">Seq #{l2_curr} ({l2_sku})</span>
+                <span id="l2_base_text">Seq #{l2_curr} ({html.escape(l2_sku)})</span>
                 <span id="l2_badge" class="complete-badge" style="background:#e0f2fe; color:#0369a1;">🏁 BATCH FINISHED</span>
             </div>
             <div class="progress-bar-bg"><div class="progress-bar-fill" id="l2_prog" style="background: #0284c7;"></div></div>
             <div class="timer-badge" id="l2_timer" style="color:#0369a1; background:#e0f2fe;">⏱️ Next Batch in: calculating...</div>
         </div>
 
-        <!-- CADENCE STATUS -->
         <div style="flex: 0.4; text-align: right; border-left: 1px solid #cbd5e1; padding-left: 15px;">
             <div style="font-size: 11px; font-weight: 800; color: #64748b; text-transform: uppercase;">Factory Cadence</div>
             <div style="font-size: 14px; font-weight: 900; color: #00c853;">● 1-Min Takt</div>
@@ -1824,20 +2112,18 @@ takt_banner_html = f"""
             l1_elapsed++;
             l2_elapsed++;
 
-            // LINE 1 LOGIC
             if (l1_elapsed >= l1_target_sec) {{
                 chimeAudio.play().catch(e => console.log('Audio blocked'));
                 document.getElementById('l1_badge').style.display = 'inline-block';
-                l1_elapsed = 0; // Seamless reset for the next batch cycle
+                l1_elapsed = 0;
             }} else {{
                 document.getElementById('l1_badge').style.display = 'none';
             }}
 
-            // LINE 2 LOGIC
             if (l2_elapsed >= l2_target_sec) {{
                 chimeAudio.play().catch(e => console.log('Audio blocked'));
                 document.getElementById('l2_badge').style.display = 'inline-block';
-                l2_elapsed = 0; // Seamless reset for the next batch cycle
+                l2_elapsed = 0;
             }} else {{
                 document.getElementById('l2_badge').style.display = 'none';
             }}
@@ -1845,13 +2131,11 @@ takt_banner_html = f"""
             sessionStorage.setItem('l1_elapsed_sec', l1_elapsed);
             sessionStorage.setItem('l2_elapsed_sec', l2_elapsed);
 
-            // Render Line 1 Progress
             let l1_pct = Math.min(100, (l1_elapsed / l1_target_sec) * 100);
             let l1_left = Math.max(0, l1_target_sec - l1_elapsed);
             document.getElementById('l1_prog').style.width = l1_pct + '%';
             document.getElementById('l1_timer').innerText = '⏱️ Next Batch in: ' + Math.floor(l1_left / 60) + 'm ' + (l1_left % 60) + 's';
 
-            // Render Line 2 Progress
             let l2_pct = Math.min(100, (l2_elapsed / l2_target_sec) * 100);
             let l2_left = Math.max(0, l2_target_sec - l2_elapsed);
             document.getElementById('l2_prog').style.width = l2_pct + '%';
@@ -1880,7 +2164,7 @@ else:
     st.sidebar.warning("⚠️ No LX02 loaded. Bins will show 'Awaiting Staging'.")
 
 # ---------------------------------------------------------
-# RESTORED FULL FILTERS (STATUS + SEQUENCE PRIORITIZATION)
+# VIEWING, LINE & PRIORITY FILTERS
 # ---------------------------------------------------------
 st.subheader("🎛️ Viewing, Line & Priority Filters")
 f_col1, f_col2, f_col3, f_col4 = st.columns(4)
@@ -1896,7 +2180,6 @@ status_filter = f_col2.selectbox(
 pss_filter = f_col3.selectbox("Filter PSS Type:", ["All", "Pallet", "Trolley", "FLC"])
 search_text = f_col4.text_input("Search Part ID / Name:", "")
 
-# --- HORIZON / SEQUENCE INPUT BLOCK ---
 sf_col1, sf_col2, sf_col3 = st.columns([1, 1.2, 1.8])
 hide_hold = sf_col1.checkbox("Hide HOLD Batches", value=True)
 
@@ -1921,7 +2204,6 @@ elif selection_mode.startswith("🔢"):
         default=available_seqs[:3] if len(available_seqs) >= 3 else available_seqs
     )
 
-# Compute active Line#Seq keys and the cutoff
 active_seq_keys, cutoff_seq_keys = resolve_dispatch_sequences(
     batches_df=batches_df,
     target_units=int(target_dispatch_qty) if target_dispatch_qty else None,
@@ -1930,96 +2212,152 @@ active_seq_keys, cutoff_seq_keys = resolve_dispatch_sequences(
     l2_start=st.session_state.get("current_running_seq_l2", 1)
 )
 
+# ---------------------------------------------------------
+# COMPUTE CORE REPLENISHMENT MATH (CACHED)
+# ---------------------------------------------------------
+def compute_sequence_walk(
+    batches: pd.DataFrame,
+    bom_df: pd.DataFrame,
+    mb52_df: pd.DataFrame,
+    cogi_df: pd.DataFrame,
+    sto_df: pd.DataFrame,
+    lx02_df: pd.DataFrame,
+    snapshot_id: str,
+) -> pd.DataFrame:
+    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, _ = extract_detailed_stock_maps(mb52_df, lx02_df)
+    sto_qty_map, sto_po_map = process_open_sto(sto_df)
+    balances = StockBalances.from_maps(
+        m002_rm01_map, m002_ps01_map, process_cogi_dump(cogi_df), sto_qty_map, w004_rm01_map, sto_po_map,
+        m002_pv01=m002_pv01_map,
+    )
+    return run_walk(
+        batches, bom_df, balances,
+        handled_units=set(OFFICIAL_PSS_MASTER),
+        pss_lookup=get_official_pss,
+        snapshot_id=snapshot_id,
+        descriptions=build_description_map(mb52_df, lx02_df, bom_df),
+    )
 
-# ---------------------------------------------------------
-# COMPUTE CORE REPLENISHMENT MATH (GRACEFUL NON-BLOCKING)
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# COMPUTE CORE REPLENISHMENT MATH (CACHED - INSTANT ON SCAN)
-# ---------------------------------------------------------
-# Unique signature: only recalculates if filters or files actually change!
-mb52_in = st.session_state.get("mb52_df", pd.DataFrame())
-cogi_in = st.session_state.get("cogi_df", pd.DataFrame())
-sto_in = st.session_state.get("sto_df", pd.DataFrame())
+lx02_in = st.session_state.get("lx02_df", pd.DataFrame())
+upload_source = SapUploadSource(
+    st.session_state.get("mb52_df", pd.DataFrame()),
+    st.session_state.get("cogi_df", pd.DataFrame()),
+    st.session_state.get("sto_df", pd.DataFrame()),
+    lx02_in,
+)
+stock_source = upload_source
+if stock_source_choice == SOURCE_DATABRICKS and databricks_settings is not None:
+    stock_source = DatabricksSource(databricks_settings)
+try:
+    sap_snapshot = stock_source.load()
+except DataSourceError as exc:
+    st.sidebar.error(f"❌ {exc} Using SAP uploads.")
+    sap_snapshot = upload_source.load()
 
-filter_signature = f"{line_filter}_{status_filter}_{pss_filter}_{sorted(list(active_seq_keys))}_{calc_mode}_{len(batches_df)}_{len(mb52_in)}"
+mb52_in, cogi_in, sto_in = sap_snapshot.mb52, sap_snapshot.cogi, sap_snapshot.sto
 
-need_recompute = (
-    "cached_master_df" not in st.session_state or
-    st.session_state.get("last_calc_signature") != filter_signature or
+bom_for_walk = get_master_bom_df()
+plan_sequences = order_plan_sequences(batches_df)
+batch_fingerprint = (
+    frame_fingerprint(plan_sequences[["Line", "ScaleX_Sequence_No", "SKUName", "Count"]])
+    + f"_bom{len(bom_for_walk)}"
+)
+walk_key = f"{sap_snapshot.snapshot_id}|{batch_fingerprint}"
+
+new_walk = (
+    "walk_df" not in st.session_state or
+    st.session_state.get("walk_key") != walk_key or
     st.session_state.pop("force_recalculate", False)
 )
 
-if need_recompute:
-    master_df = calculate_band2_and_pss_engine(
-        batches_df, mb52_in, cogi_in, sto_in, line_filter, hide_hold, active_seq_keys, calc_mode
-    )
-    st.session_state["cached_master_df"] = master_df
-    st.session_state["last_calc_signature"] = filter_signature
+write_audit = False
 
-    # -------------------------------------------------------------
-    # 🚀 WRITE TO SQLITE & AUDIT_VAULT ONLY ON NEW COMPUTATION:
-    # -------------------------------------------------------------
-    if not master_df.empty:
-        run_id = f"run_{time.strftime('%Y%m%d_%H%M%S')}_{get_client_ip().replace('.', '_')}"
-        m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = extract_detailed_stock_maps(mb52_in)
-        sto_q_map, sto_po_map = process_open_sto(sto_in)
+if new_walk:
+    with get_db_connection() as conn:
+        existing_run_id = (
+            find_walk_run(conn, sap_snapshot.snapshot_id, batch_fingerprint)
+            if sap_snapshot.is_complete else None
+        )
+        action = walk_action(sap_snapshot.is_complete, existing_run_id)
+        walk_df = load_walk_rows(conn, existing_run_id) if action == WALK_REUSE else None
+    walk_run_id = existing_run_id
 
-        audit_batch = []
-        for _, r in master_df.iterrows():
+    if walk_df is None:
+        if bom_for_walk.empty:
+            st.error("🚨 BOM file not found. Upload it in the sidebar.")
+        walk_df = compute_sequence_walk(
+            batches_df, bom_for_walk, mb52_in, cogi_in, sto_in, lx02_in, sap_snapshot.snapshot_id
+        )
+
+    if action == WALK_NEW:
+        with get_db_connection() as conn:
+            walk_run_id, write_audit = claim_walk_run(
+                conn,
+                f"walk_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+                walk_df,
+                {
+                    "snapshot_id": sap_snapshot.snapshot_id,
+                    "batch_fingerprint": batch_fingerprint,
+                    "source": sap_snapshot.source,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "client_ip": get_client_ip(),
+                    "sequence_count": plan_sequences["seq_key"].nunique(),
+                    "material_count": walk_df["part_key"].nunique() if not walk_df.empty else 0,
+                    "total_trigger": walk_df["trigger"].sum() if not walk_df.empty else 0.0,
+                },
+            )
+        flush_db_to_disk()
+
+    st.session_state["walk_df"] = walk_df
+    st.session_state["walk_key"] = walk_key
+    st.session_state["walk_run_id"] = walk_run_id
+
+walk_df = st.session_state["walk_df"]
+walk_run_id = st.session_state["walk_run_id"]
+
+line_walk_df = walk_df if line_filter == "All" else walk_df[walk_df["line"].str.lower() == line_filter.lower()]
+selected_seq_keys = active_seq_keys if active_seq_keys else None
+master_df = consolidate(line_walk_df, selected_seq_keys)
+st.session_state["cached_master_df"] = master_df
+if not walk_df.empty and master_df.empty:
+    st.warning("⚠️ No batches selected in the dispatch horizon.")
+
+if write_audit:
+    # -------------------------------------------------------------
+    # 🚀 WRITE THE FULL WALK (EVERY SEQUENCE, BOTH LINES) TO SQLITE, ONCE PER PICKLIST
+    # -------------------------------------------------------------
+    run_id = walk_run_id
+    audit_df = consolidate(walk_df, None)
+    sto_taken_by_part = walk_df.groupby("part_key")["sto_taken"].sum().to_dict() if not walk_df.empty else {}
+    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = extract_detailed_stock_maps(mb52_in)
+    sto_q_map, sto_po_map = process_open_sto(sto_in)
+
+    # Load BOM to identify every part in the plant
+    bom_source = st.session_state.get("uploaded_bom_df", pd.DataFrame())
+    bom_source = get_master_bom_df()
+
+    c_col = find_column_by_priority(bom_source, ["child material", "child_material", "component", "material", "part"])
+    p_col = find_column_by_priority(bom_source, ["parent material", "parent_material", "parent", "sku", "vehicle"])
+    
+    master_keys = set(audit_df["Part ID"].apply(clean_sap_key)) if not audit_df.empty else set()
+    audit_batch = []
+
+    # 1. Log every part on any PLAN sequence of the walk
+    if not audit_df.empty:
+        for _, r in audit_df.iterrows():
             pid = str(r["Part ID"]).strip()
             clean_pid = clean_sap_key(pid)
             seq_num = int(r["Sequence_Order"])
             sku_name = str(r.get("Vehicle_SKU", ""))
 
-            # 🎯 ROBUST SCALEX BATCH RESOLVER:
-            # 1. Match by SKU Name & Status first
-            match_batches = batches_df[
-                (batches_df["SKUName"].astype(str).str.strip().str.upper() == sku_name.split(",")[0].strip().upper()) &
-                (batches_df["Status"] == "PLAN")
-            ]
-            
-            # 2. Fallback to Sequence Number if SKU match empty
-            if match_batches.empty:
-                match_batches = batches_df[
-                    (batches_df["ScaleX_Sequence_No"] == seq_num) & 
-                    (batches_df["Status"] == "PLAN")
-                ]
-
-            if not match_batches.empty:
-                row_batch = match_batches.iloc[0]
-                s_start = int(row_batch.get("Serial_Start", row_batch.get("Serial No Start", 0)))
-                s_end = int(row_batch.get("Serial_End", row_batch.get("Serial No End", 0)))
-                b_qty = int(row_batch.get("Count", row_batch.get("Plan Qty", 0)))
-                target_line = str(row_batch.get("Line", line_filter))
-                if not sku_name or sku_name == "nan":
-                    sku_name = str(row_batch.get("SKUName", ""))
-            else:
-                s_start = 0
-                s_end = 0
-                b_qty = 0
-                target_line = line_filter
-
-            # Check if this sequence was the cutoff boundary
-            is_cutoff = any(f"#{seq_num}" in str(k) for k in cutoff_seq_keys)
-
             m_rm01 = m002_rm01_map.get(clean_pid, 0.0)
             m_ps01 = m002_ps01_map.get(clean_pid, 0.0)
             m_pv01 = m002_pv01_map.get(clean_pid, 0.0)
             w_rm01 = w004_rm01_map.get(clean_pid, 0.0)
-            w_tot = w004_tot_map.get(clean_pid, 0.0)
             sto_val = sto_q_map.get(clean_pid, 0.0)
 
-            status, code, reason, d_fulfil = classify_material_decision(
-                demand=float(r["BOM Demand"]),
-                m002_avail=float(m_rm01 + m_ps01 - r.get("COGI Qty", 0)),
-                w004_stock=float(w_rm01),
-                open_sto=float(sto_val),
-                truck_scanned=0.0,
-                pv01_stock=float(m_pv01),
-                is_hold_batch=False,
-                unit_usage=1.0,
-                safety_buffer_mins=30
+            status, code, reason = audit_decision(
+                str(r["Transfer Status"]), float(sto_taken_by_part.get(clean_pid, 0.0))
             )
 
             record_item = {
@@ -2027,13 +2365,13 @@ if need_recompute:
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "client_ip": get_client_ip(),
                 "calculation_mode": calc_mode,
-                "line": target_line,
+                "line": "All",
                 "sequence_no": seq_num,
                 "sku_name": sku_name,
-                "serial_no_start": s_start,
-                "serial_no_end": s_end,
-                "batch_plan_qty": b_qty,
-                "is_cutoff_sequence": is_cutoff,
+                "serial_no_start": 0,
+                "serial_no_end": 0,
+                "batch_plan_qty": 0,
+                "is_cutoff_sequence": False,
                 "part_id": pid,
                 "part_description": str(r["Part Name"]),
                 "storage_bin": str(r.get("Location", "-")),
@@ -2048,7 +2386,7 @@ if need_recompute:
                 "m002_pv01": float(m_pv01),
                 "m002_effective_avail": float(m_rm01 + m_ps01 - r.get("COGI Qty", 0)),
                 "w004_rm01": float(w_rm01),
-                "w004_total": float(w_tot),
+                "w004_total": float(w004_tot_map.get(clean_pid, 0.0)),
                 "cogi_error_qty": float(r.get("COGI Qty", 0)),
                 "open_sto_in_transit": float(sto_val),
                 "open_po_numbers": str(r.get("Open PO Numbers", "")),
@@ -2057,7 +2395,7 @@ if need_recompute:
                 "picklist_status": status,
                 "decision_code": code,
                 "decision_reason": reason,
-                "demand_to_fulfil": float(d_fulfil),
+                "demand_to_fulfil": float(r["Demand to Fulfil"]),
                 "need_to_be_picked": float(r["Need to be Picked"]),
                 "pss_boxes_to_pick": int(r["To be picked PSS count"]),
                 "starvation_minutes": int(r["Starvation_Mins"]),
@@ -2066,13 +2404,355 @@ if need_recompute:
             record_item["raw_json"] = json.dumps(record_item)
             audit_batch.append(record_item)
 
-        record_audit_run(run_id, audit_batch)
+    # 2. Log all Excluded/Cutoff Parts (Guarantees BD0503B003ANNA is logged)
+    if not bom_source.empty and c_col:
+        unique_bom_children = bom_source[[c_col]].drop_duplicates()
+        for _, b_row in unique_bom_children.iterrows():
+            raw_child = str(b_row[c_col]).strip()
+            clean_child = clean_sap_key(raw_child)
+            
+            if clean_child not in master_keys and len(clean_child) > 2:
+                box_sz, p_type = get_official_pss(raw_child)
+                w_rm01 = w004_rm01_map.get(clean_child, 0.0)
+                m_rm01 = m002_rm01_map.get(clean_child, 0.0)
 
+                record_item = {
+                    "audit_run_id": run_id,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "client_ip": get_client_ip(),
+                    "calculation_mode": calc_mode,
+                    "line": "All",
+                    "sequence_no": 0,
+                    "sku_name": "Excluded_Batch",
+                    "serial_no_start": 0,
+                    "serial_no_end": 0,
+                    "batch_plan_qty": 0,
+                    "is_cutoff_sequence": True,
+                    "part_id": raw_child,
+                    "part_description": part_descriptions.get(clean_child, "Standard Part"),
+                    "storage_bin": part_locations.get(clean_child, "-"),
+                    "storage_type": part_types.get(clean_child, "-"),
+                    "pss_type": p_type,
+                    "pss_box_size": box_sz,
+                    "bom_usage": 1.0,
+                    "gross_batch_demand": 0.0,
+                    "total_horizon_demand": 0.0,
+                    "m002_rm01": float(m_rm01),
+                    "m002_ps01": float(m002_ps01_map.get(clean_child, 0.0)),
+                    "m002_pv01": float(m002_pv01_map.get(clean_child, 0.0)),
+                    "m002_effective_avail": float(m_rm01),
+                    "w004_rm01": float(w_rm01),
+                    "w004_total": float(w_rm01),
+                    "cogi_error_qty": 0.0,
+                    "open_sto_in_transit": float(sto_q_map.get(clean_child, 0.0)),
+                    "open_po_numbers": "",
+                    "truck_scanned_qty": 0.0,
+                    "effective_pipeline_total": float(m_rm01),
+                    "picklist_status": "REJECTED",
+                    "decision_code": "REJECTED_HORIZON_CUTOFF",
+                    "decision_reason": "Part is not on any PLAN sequence in this walk (not scheduled, or HOLD).",
+                    "demand_to_fulfil": 0.0,
+                    "need_to_be_picked": 0.0,
+                    "pss_boxes_to_pick": 0,
+                    "starvation_minutes": 999,
+                    "priority": "EXCLUDED",
+                }
+                record_item["raw_json"] = json.dumps(record_item)
+                audit_batch.append(record_item)
+
+    # Commit all parts to SQLite
+    st.session_state["drive_result"] = record_audit_run(run_id, audit_batch)
+
+drive_result = st.session_state.get("drive_result")
+if drive_result is None:
+    st.sidebar.caption("☁️ Picklist folder updates on the next new walk.")
+elif drive_result.ok:
+    st.sidebar.success(f"☁️ {drive_result.message}")
+elif drive_result.status == PICKLIST_SKIPPED:
+    st.sidebar.caption(f"☁️ {drive_result.message}")
 else:
-    # 👈 THIS WAS MISSING!
-    master_df = st.session_state.get("cached_master_df", pd.DataFrame())
-    
-# LIVE DATA HEALTH DIAGNOSTIC (VERIFIES INGESTION)
+    st.sidebar.error(f"☁️ {drive_result.message}")
+
+
+# ---------------------------------------------------------
+# UNIVERSAL AUDITOR: ROOT-CAUSE ENGINE FOR ALL PARTS
+# ---------------------------------------------------------
+with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All Parts)", expanded=False):
+    # 1. Gather all known unique part IDs across BOM, master_df, LX02, and MB52
+    all_known_parts = set()
+    if not master_df.empty and "Part ID" in master_df.columns:
+        all_known_parts.update(master_df["Part ID"].dropna().astype(str).str.strip().unique())
+    if "uploaded_bom_df" in st.session_state and not st.session_state["uploaded_bom_df"].empty:
+        b_df = st.session_state["uploaded_bom_df"]
+        c_col = find_column_by_priority(b_df, ["child material", "component", "material", "part"])
+        if c_col:
+            all_known_parts.update(b_df[c_col].dropna().astype(str).str.strip().unique())
+    elif LOCAL_BOM_PATH and os.path.exists(LOCAL_BOM_PATH):
+        try:
+            b_df = get_master_bom_df()
+            if not b_df.empty:
+                c_col = find_column_by_priority(b_df, ["child material", "component", "material", "part"])
+                if c_col:
+                    all_known_parts.update(b_df[c_col].dropna().astype(str).str.strip().unique())
+        except Exception:
+            pass
+
+    sorted_parts_list = sorted([p for p in all_known_parts if len(p) > 2])
+
+    tab_auditor_single, tab_auditor_all = st.tabs(["🎯 Single Part Deep-Dive", "📋 Audit Decision Matrix (All Parts)"])
+
+    # ---------------------------------------------------------
+    # TAB A: SINGLE PART DEEP-DIVE
+    # ---------------------------------------------------------
+    with tab_auditor_single:
+        c_sel1, c_sel2 = st.columns([2, 1])
+        selected_part = c_sel1.selectbox(
+            "Select or type Part ID to audit:",
+            options=sorted_parts_list,
+            index=sorted_parts_list.index("BD0503B003ANNA") if "BD0503B003ANNA" in sorted_parts_list else 0,
+            help="Type to search any component in the factory."
+        )
+
+        manual_override = c_sel2.text_input("Or type raw Part ID:", value="").strip().upper()
+        target_part = manual_override if manual_override else selected_part
+
+        if target_part:
+            clean_target = clean_sap_key(target_part)
+            found_in_master = master_df[master_df["Part ID"].apply(clean_sap_key) == clean_target]
+
+            # Ingest raw maps for background diagnostic
+            m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, _ = extract_detailed_stock_maps(mb52_in)
+            cogi_map = process_cogi_dump(cogi_in)
+            sto_q_map, sto_po_map = process_open_sto(sto_in)
+
+            m_rm01 = m002_rm01_map.get(clean_target, 0.0)
+            m_ps01 = m002_ps01_map.get(clean_target, 0.0)
+            m_pv01 = m002_pv01_map.get(clean_target, 0.0)
+            cogi_val = cogi_map.get(clean_target, 0.0)
+            w_rm01 = w004_rm01_map.get(clean_target, 0.0)
+            open_sto_val = sto_q_map.get(clean_target, 0.0)
+            open_pos = sto_po_map.get(clean_target, "None")
+            box_sz, p_type = get_official_pss(target_part)
+
+            if not found_in_master.empty:
+                row = found_in_master.iloc[0]
+                status_str = str(row["Transfer Status"])
+
+                if "Ready" in status_str:
+                    st.success(f"🟢 **TRIGGER ACTIVE:** Part **{target_part}** is scheduled for transfer!")
+                elif "Out of Stock" in status_str:
+                    st.error(f"🔴 **DEFICIT DETECTED / W004 STOCKOUT:** Part **{target_part}** needs pick, but W004 RM01 has 0 stock!")
+                elif "Partial" in status_str:
+                    st.warning(f"🟡 **PARTIAL TRANSFER:** W004 has stock, but less than total required PSS.")
+                else:
+                    st.info(f"⚪ **NO TRANSFER REQUIRED:** Part **{target_part}** has sufficient floor buffer or pipeline.")
+
+                # KPI Metrics
+                m_c1, m_c2, m_c3, m_c4, m_c5 = st.columns(5)
+                m_c1.metric("Gross Demand", f"{int(row['BOM Demand'])} pcs")
+                m_c2.metric("M002 Net Available", f"{int(row['Total M002 Pipeline'])} pcs", help="RM01 + PS01 - COGI - Preceding batches")
+                m_c3.metric("W004 Stock", f"{int(row['W004 Stock'])} pcs")
+                m_c4.metric("Need to Pick", f"{int(row['Need to be Picked'])} pcs")
+                m_c5.metric("PSS Boxes", f"{int(row['To be picked PSS count'])} {p_type}s")
+
+                st.markdown("#### 🔬 Detailed Stock Math Breakdown")
+                b_c1, b_c2 = st.columns(2)
+                with b_c1:
+                    st.write(f"- **M002 RM01 (Floor Stock):** `{int(m_rm01)}` pcs")
+                    st.write(f"- **M002 PS01 (Staging):** `{int(m_ps01)}` pcs")
+                    st.write(f"- **M002 PV01 (Unusable/Quarantine):** `{int(m_pv01)}` pcs")
+                    st.write(f"- **COGI Backflush Errors:** `{int(cogi_val)}` pcs")
+                with b_c2:
+                    st.write(f"- **Open STO In-Transit (W004 ➡️ M002):** `{int(open_sto_val)}` pcs (PO: `{open_pos}`)")
+                    st.write(f"- **W004 RM01 Available:** `{int(w_rm01)}` pcs")
+                    st.write(f"- **Earliest Sequence Needed:** `Seq #{row['Sequence_Order']}` (~{row['Starvation_Mins']} mins)")
+                    st.write(f"- **Vehicle Models Covered:** `{row.get('Vehicle_SKU', 'N/A')}`")
+
+            else:
+                # Part NOT in active master_df -> Run root cause diagnostic
+                st.error(f"❌ **{target_part}** did NOT trigger and is NOT in active dispatch demand.")
+                st.markdown("### 🕵️ Automated Root-Cause Trace")
+
+                # Check if part exists in BOM
+                bom_source = st.session_state.get("uploaded_bom_df", pd.DataFrame())
+                bom_source = get_master_bom_df()
+
+                c_col = find_column_by_priority(bom_source, ["child material", "component", "material", "part"])
+                p_col = find_column_by_priority(bom_source, ["parent material", "parent", "sku", "vehicle"])
+                q_col = find_column_by_priority(bom_source, ["comp qty", "quantity", "qty", "menge"])
+
+                if not bom_source.empty and c_col and p_col:
+                    parent_matches = bom_source[bom_source[c_col].apply(clean_sap_key) == clean_target]
+                    if not parent_matches.empty:
+                        parent_skus = parent_matches[p_col].dropna().unique().tolist()
+                        unit_qty = parent_matches[q_col].iloc[0] if q_col else "1.0"
+                        st.write(f"1. **BOM Verification:** ✅ Exists in BOM under parent SKU(s): `{', '.join(parent_skus)}` (Usage: `{unit_qty}` per vehicle).")
+
+                        # Check if parent SKUs are in ScaleX batches
+                        matched_batches = batches_df[batches_df["SKUName"].apply(clean_sap_key).isin([clean_sap_key(x) for x in parent_skus])]
+                        if not matched_batches.empty:
+                            st.write(f"2. **Production Plan Check:** Found `{len(matched_batches)}` scheduled batches for these SKUs.")
+                            for _, b in matched_batches.iterrows():
+                                b_seq = int(b.get("ScaleX_Sequence_No", 0))
+                                b_stat = str(b.get("Status", "")).upper()
+                                b_key = f"{b['Line']}#{b_seq}"
+                                is_in_active = b_key in active_seq_keys
+
+                                if b_stat == "HOLD":
+                                    st.warning(f"- **{b['Line']} Seq #{b_seq} ({b['SKUName']}):** Batch status is **HOLD** (Excluded from picking).")
+                                elif not is_in_active:
+                                    st.warning(f"- **{b['Line']} Seq #{b_seq} ({b['SKUName']}):** Beyond current horizon cutoff (Selected horizon excludes Seq #{b_seq}).")
+                                else:
+                                    st.info(f"- **{b['Line']} Seq #{b_seq} ({b['SKUName']}):** In horizon, but floor pipeline (`{int(m_rm01 + m_ps01 + open_sto_val)}` pcs) covers total batch demand.")
+                        else:
+                            st.error(f"2. **Production Plan Check:** ❌ None of the parent SKUs (`{', '.join(parent_skus)}`) are scheduled in today's ScaleX batches.")
+                    else:
+                        st.error(f"1. **BOM Verification:** ❌ Part `{target_part}` does not exist as a child component in `bom.csv`.")
+
+    # ---------------------------------------------------------
+    # TAB B: AUDIT DECISION MATRIX (ALL PARTS SIMULTANEOUSLY)
+    # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    # TAB B: TRUE AUDIT DECISION MATRIX (INCLUDES EXCLUDED/CUTOFF PARTS)
+    # ---------------------------------------------------------
+    with tab_auditor_all:
+        st.caption("Live decision breakdown for EVERY component in the plant (including cutoff & HOLD parts).")
+
+        # 1. Load Master BOM to ensure 100% of factory parts are audited
+        bom_source = get_master_bom_df()
+
+        c_col = find_column_by_priority(bom_source, ["child material", "child_material", "component", "material", "part"])
+        p_col = find_column_by_priority(bom_source, ["parent material", "parent_material", "parent", "sku", "vehicle", "model"])
+        d_col = find_column_by_priority(bom_source, ["description", "material description", "component description"])
+
+        # Ingest live stock maps
+        m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = (
+        extract_detailed_stock_maps(mb52_in, lx02_raw) )
+        sto_q_map, _ = process_open_sto(sto_in)
+
+        # 2. Build indexed lookup of master_df for fast matching
+        master_lookup = {}
+        if not master_df.empty:
+            for _, r in master_df.iterrows():
+                master_lookup[clean_sap_key(r["Part ID"])] = r
+
+        # 3. Compile Master Part List across BOM and master_df
+        all_part_keys = set(master_lookup.keys())
+        bom_parent_map = {}
+        bom_desc_map = {}
+
+        if not bom_source.empty and c_col and p_col:
+            # 1. Deduplicate to unique components first
+            unique_bom = bom_source[[c_col, p_col] + ([d_col] if d_col else [])].dropna(subset=[c_col]).drop_duplicates(subset=[c_col])
+            
+            clean_children = [clean_sap_key(x) for x in unique_bom[c_col].values]
+            parents = unique_bom[p_col].astype(str).str.strip().values
+            all_part_keys.update(clean_children)
+
+            for c_clean, p_raw in zip(clean_children, parents):
+                bom_parent_map.setdefault(c_clean, set()).add(p_raw)
+
+            if d_col:
+                descriptions = unique_bom[d_col].astype(str).str.strip().values
+                bom_desc_map = dict(zip(clean_children, descriptions))
+
+        audit_table_data = []
+
+        for clean_p in all_part_keys:
+            # CASE A: Part is inside the active 180m horizon
+            if clean_p in master_lookup:
+                r = master_lookup[clean_p]
+                pid = r["Part ID"]
+                w004 = int(r["W004 Stock"])
+                m002_eff = int(r["Total M002 Pipeline"])
+                demand = int(r["BOM Demand"])
+                status_str = str(r["Transfer Status"])
+                pick_q = int(r["Need to be Picked"])
+                seq_val = f"Seq #{r['Sequence_Order']}"
+
+                if "Ready" in status_str:
+                    trig_badge = "🟢 YES (Full Pick)"
+                    reason = f"Deficit of {r['Demand to Fulfil']} pcs; fully available in W004."
+                elif "Partial" in status_str:
+                    trig_badge = "🟡 YES (Partial)"
+                    reason = f"Deficit of {r['Demand to Fulfil']} pcs; partial stock ({w004} pcs) in W004."
+                elif "Out of Stock" in status_str:
+                    trig_badge = "🔴 ESCALATED (0 Stock)"
+                    reason = f"Deficit of {r['Demand to Fulfil']} pcs exists, but W004 RM01 is 0."
+                else:
+                    trig_badge = "⚪ NO (M002 Sufficient)"
+                    reason = f"M002 floor stock/pipeline ({m002_eff} pcs) covers demand ({demand} pcs)."
+
+            # CASE B: Part is in BOM, but was EXCLUDED from current horizon
+            else:
+                pid = clean_p
+                w004 = int(w004_rm01_map.get(clean_p, 0) or w004_tot_map.get(clean_p, 0))
+                m002_eff = int(m002_rm01_map.get(clean_p, 0) + m002_ps01_map.get(clean_p, 0) + sto_q_map.get(clean_p, 0))
+                demand = 0
+                pick_q = 0
+                seq_val = "Not Active"
+
+                # Check why it didn't enter master_df
+                parent_models = list(bom_parent_map.get(clean_p, []))
+                matched_batches = batches_df[batches_df["SKUName"].apply(clean_sap_key).isin([clean_sap_key(x) for x in parent_models])]
+
+                if matched_batches.empty:
+                    trig_badge = "🚫 NO (Not in Plan)"
+                    reason = f"Parent SKU ({', '.join(parent_models[:2])}) not scheduled in today's 31 batches."
+                else:
+                    first_b = matched_batches.iloc[0]
+                    b_seq = int(first_b.get("ScaleX_Sequence_No", 0))
+                    b_line = str(first_b.get("Line", ""))
+                    b_status = str(first_b.get("Status", "")).upper()
+
+                    if b_status == "HOLD":
+                        trig_badge = "⛔ NO (Batch on HOLD)"
+                        reason = f"Scheduled on {b_line} Seq #{b_seq}, but batch is on HOLD."
+                    else:
+                        trig_badge = "⏳ NO (Beyond 180m Cutoff)"
+                        reason = f"Scheduled on {b_line} Seq #{b_seq}. Beyond the {target_dispatch_qty or 180}m horizon cutoff."
+
+            audit_table_data.append({
+                "Seq #": seq_val,
+                "Part ID": pid,
+                "Description": bom_desc_map.get(clean_p, part_descriptions.get(clean_p, "Standard Part")),
+                "BOM Demand": demand,
+                "M002 Available": m002_eff,
+                "W004 Stock": w004,
+                "Open STO": int(sto_q_map.get(clean_p, 0)),
+                "Trigger Fired?": trig_badge,
+                "Pick Qty": pick_q,
+                "Decision Reason": reason
+            })
+
+        df_matrix = pd.DataFrame(audit_table_data)
+
+        # Matrix Search & Filters
+        c_f1, c_f2 = st.columns([2, 1])
+        search_mat = c_f1.text_input("Filter Matrix by Part ID / Name:", value="BD0503B003ANNA", key="auditor_matrix_search")
+        filter_trig = c_f2.selectbox("Filter by Trigger Result:", ["All", "Trigger Fired (Yes)", "Escalated (0 Stock)", "Beyond Horizon / Cutoff", "Suppressed (Sufficient)"], key="auditor_matrix_filter")
+
+        if search_mat:
+            clean_search = clean_sap_key(search_mat)
+            df_matrix = df_matrix[
+                df_matrix["Part ID"].astype(str).str.contains(search_mat, case=False, na=False) |
+                df_matrix["Part ID"].apply(clean_sap_key).str.contains(clean_search, case=False, na=False) |
+                df_matrix["Description"].astype(str).str.contains(search_mat, case=False, na=False)
+            ]
+
+        if filter_trig == "Trigger Fired (Yes)":
+            df_matrix = df_matrix[df_matrix["Trigger Fired?"].str.contains("YES")]
+        elif filter_trig == "Escalated (0 Stock)":
+            df_matrix = df_matrix[df_matrix["Trigger Fired?"].str.contains("ESCALATED")]
+        elif filter_trig == "Beyond Horizon / Cutoff":
+            df_matrix = df_matrix[df_matrix["Trigger Fired?"].str.contains("Beyond|Cutoff|HOLD|Plan")]
+        elif filter_trig == "Suppressed (Sufficient)":
+            df_matrix = df_matrix[df_matrix["Trigger Fired?"].str.contains("Sufficient")]
+
+        st.dataframe(df_matrix, use_container_width=True, hide_index=True)
+        csv_mat = df_matrix.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download Full Audit Matrix (CSV)", data=csv_mat, file_name="Trigger_Decision_Audit_Matrix.csv", mime="text/csv")
+            
 with st.expander("🔍 System Ingestion Diagnostics (Check Active Files)", expanded=master_df.empty):
     d_col1, d_col2, d_col3, d_col4 = st.columns(4)
     d_col1.write(f"**ScaleX Batches:** {len(batches_df)} rows")
@@ -2081,9 +2761,8 @@ with st.expander("🔍 System Ingestion Diagnostics (Check Active Files)", expan
     d_col4.write(f"**Open STO:** {len(sto_in)} items" if not sto_in.empty else "ℹ️ **STO:** 0 in transit")
     
     if master_df.empty:
-        st.warning("⚠️ **No material demand generated.** This happens if: (1) Selected sequences contain only HOLD batches, (2) Line filter excluded all batches, or (3) `bom.csv` is missing.")
-        st.info("💡 **Quick Fix:** In the top filter bar, set 'Sequence Prioritization Preset' to **'Full Shift (All Sequences)'** and uncheck 'Hide HOLD Batches'.")
-# If master_df is empty, create safe placeholder so page NEVER crashes
+        st.warning("⚠️ **No material demand generated.** Check filters, HOLD status, or BOM mappings.")
+
 if master_df.empty:
     master_df = pd.DataFrame(columns=[
         "Sequence_Order", "Part ID", "Part Name", "Location", "BOM Demand", "Demand to Fulfil",
@@ -2092,13 +2771,6 @@ if master_df.empty:
         "Priority", "Sequences_Covered", "Transfer Qty (W004 ➡️ M002)", "Transfer Status", "Is_Zero_Stock"
     ])
 
-
-
-
-
-
-
-# Dual-Key Location & Real Description Resolver
 def resolve_bin_location(part_id: Any) -> str:
     pid_raw = str(part_id).strip().upper()
     pid_norm = clean_sap_key(pid_raw)
@@ -2121,9 +2793,10 @@ def resolve_real_description(part_id: Any, current_desc: str) -> str:
 if not master_df.empty and "Part ID" in master_df.columns:
     master_df["Location"] = master_df["Part ID"].map(resolve_bin_location)
     master_df["Part Name"] = master_df.apply(lambda r: resolve_real_description(r["Part ID"], r["Part Name"]), axis=1)
-    master_df["Storage_Type"] = master_df["Part ID"].map(lambda pid: part_types.get(str(pid).strip(), part_types.get(clean_sap_key(pid), "-"))
-)
-# Apply Filters Safely
+    master_df["Storage_Type"] = master_df["Part ID"].map(
+        lambda pid: part_types.get(str(pid).strip(), part_types.get(clean_sap_key(pid), "-"))
+    )
+
 view_df = master_df.copy()
 if not view_df.empty:
     if status_filter != "All Statuses":
@@ -2137,19 +2810,19 @@ if not view_df.empty:
         ]
 
 # ---------------------------------------------------------
-# HIGH-IMPACT OPERATIONAL COMMAND BANNER
+# OPERATIONAL COMMAND BANNER
 # ---------------------------------------------------------
 ready_df = master_df[master_df["Transfer Status"] == "Ready for Full Transfer"]
 stockout_df = master_df[master_df["Transfer Status"] == "W004 Out of Stock"]
 covered_df = master_df[master_df["Transfer Status"].str.contains("Sufficient|Covered by Open STO")]
 
 total_skus_to_pick = len(ready_df)
-total_sus_to_pick = int(ready_df["To be picked PSS count"].sum())
-pallets = (ready_df["PSS Type"] == "Pallet").sum()
-flcs = (ready_df["PSS Type"] == "FLC").sum()
-trolleys = (ready_df["PSS Type"] == "Trolley").sum()
+total_sus_to_pick = int(ready_df["To be picked PSS count"].sum()) if not ready_df.empty else 0
+pallets = (ready_df["PSS Type"] == "Pallet").sum() if not ready_df.empty else 0
+flcs = (ready_df["PSS Type"] == "FLC").sum() if not ready_df.empty else 0
+trolleys = (ready_df["PSS Type"] == "Trolley").sum() if not ready_df.empty else 0
 est_trucks = math.ceil(total_sus_to_pick / 40) if total_sus_to_pick > 0 else 0
-critical_starve_count = (stockout_df["Starvation_Mins"] <= 60).sum()
+critical_starve_count = (stockout_df["Starvation_Mins"] <= 60).sum() if not stockout_df.empty else 0
 
 col_work, col_risk, col_health = st.columns([1.4, 1.3, 1.0])
 with col_work:
@@ -2198,33 +2871,21 @@ with col_health:
 st.divider()
 
 # ---------------------------------------------------------
-# HIGH-PERFORMANCE OPERATOR VIEW (ZERO IFRAME LAG)
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-# EQUIPMENT-SPECIALIZED PICKLIST SPLITTER (BOPT vs TROLLEY)
+# PICKLIST SPLITTER
 # ---------------------------------------------------------
 def split_picklist_by_equipment(df_pick: pd.DataFrame, num_pickers: int) -> List[Tuple[str, str, pd.DataFrame]]:
-    """
-    Segregates picklists by Material Handling Equipment (MHE):
-    - Pallets & FLCs = Handled together via BOPT / Forklift.
-    - Trolleys = Handled via Tow Tugger / Manual Roll-on.
-    """
     if df_pick.empty:
         return []
 
-    # Segregate into Forklift/BOPT vs Roll-on Trolleys
     df_fork_bopt = df_pick[df_pick["PSS Type"].isin(["Pallet", "FLC"])].copy()
     df_trolleys = df_pick[df_pick["PSS Type"] == "Trolley"].copy()
 
-    # Catch unrecognized packaging into the BOPT bucket
     df_others = df_pick[~df_pick["PSS Type"].isin(["Pallet", "FLC", "Trolley"])].copy()
     if not df_others.empty:
         df_fork_bopt = pd.concat([df_fork_bopt, df_others], ignore_index=True)
 
     results = []
 
-    # --- CASE 1: EXACTLY 2 PICKERS ---
     if num_pickers == 2:
         total_items = len(df_pick)
         trolley_count = len(df_trolleys)
@@ -2264,7 +2925,6 @@ def split_picklist_by_equipment(df_pick: pd.DataFrame, num_pickers: int) -> List
                 p2
             ))
 
-    # --- CASE 2: 3 PICKERS ---
     elif num_pickers == 3:
         df_pallets = df_fork_bopt[df_fork_bopt["PSS Type"] == "Pallet"].sort_values(by=["Starvation Mins", "Storage Bin"]).reset_index(drop=True)
         df_flcs = df_fork_bopt[df_fork_bopt["PSS Type"] == "FLC"].sort_values(by=["Starvation Mins", "Storage Bin"]).reset_index(drop=True)
@@ -2274,7 +2934,6 @@ def split_picklist_by_equipment(df_pick: pd.DataFrame, num_pickers: int) -> List
         results.append(("🧑‍🏭 Picker 2 (BOPT - FLCs)", "📦 Powered Pallet Truck (BOPT) / FLCs", df_flcs))
         results.append(("🧑‍🏭 Picker 3 (Trolley Tugger)", "🛒 Roll-on Trolley Hitch / Tugger", p3))
 
-    # --- CASE 3: 4+ PICKERS ---
     elif num_pickers >= 4:
         results.append((
             "🧑‍🏭 Picker 1 (Trolleys)",
@@ -2292,7 +2951,6 @@ def split_picklist_by_equipment(df_pick: pd.DataFrame, num_pickers: int) -> List
             chunk = pd.DataFrame(df_bopt_sorted.iloc[start:end]).copy().reset_index(drop=True)
             results.append((f"🧑‍🏭 Picker {i+2} (BOPT - Pallet/FLC)", "🚜 Forklift / BOPT Heavy Route", chunk))
 
-    # --- CASE 4: 1 CONSOLIDATED PICKER ---
     else:
         results.append((
             "🧑‍🏭 Master Picker (Consolidated)",
@@ -2306,9 +2964,21 @@ def render_landscape_printable_view(df_subset: pd.DataFrame, sheet_title: str):
     df_print = df_subset.copy().reset_index(drop=True)
     df_print.insert(0, "S No", df_print.index + 1)
     
-    # 1. Native Fast Virtualized Display (0ms render time, no iframe memory leak)
+    def style_picklist_rows(row):
+        w004 = row.get("W004 Stock", 0)
+        need = row.get("Need to be Picked", 0)
+        status = str(row.get("Transfer Status", ""))
+        
+        if w004 == 0 or "Out of Stock" in status:
+            return ["background-color: #fee2e2; color: #991b1b; font-weight: bold;"] * len(row)
+        elif (w004 < need) or "Partial" in status:
+            return ["background-color: #fef9c3; color: #854d0e; font-weight: bold;"] * len(row)
+        elif "Ready" in status or w004 >= need:
+            return ["background-color: #dcfce7; color: #166534; font-weight: bold;"] * len(row)
+        return ["background-color: #ffffff; color: #0f172a;"] * len(row)
+
     st.dataframe(
-        df_print,
+        df_print.style.apply(style_picklist_rows, axis=1),
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -2320,39 +2990,51 @@ def render_landscape_printable_view(df_subset: pd.DataFrame, sheet_title: str):
     )
 
     c_btn1, c_btn2 = st.columns([1, 4])
-    
-    # 2. Download CSV
     csv_data = df_print.to_csv(index=False).encode("utf-8")
     c_btn1.download_button("⬇️ Export CSV", data=csv_data, file_name=f"{sheet_title.replace(' ', '_')}.csv", mime="text/csv", key=f"csv_{sheet_title}")
 
-    # 3. Clean Print Dialog (Generates print window on-demand without constantly running in background)
     table_id = f"table_{re.sub(r'[^a-zA-Z0-9_]', '', sheet_title)}"
     
     html_rows = ""
     for _, r in df_print.iterrows():
         prio_color = "#d32f2f" if "CRITICAL" in str(r.get("Priority", "")) else ("#f57c00" if "HIGH" in str(r.get("Priority", "")) else "#388e3c")
-        bin_val = r.get("Storage Bin", r.get("Location", "-"))
-        type_val = r.get("Storage Type", r.get("Storage_Type", "-"))
+        bin_val = html.escape(str(r.get("Storage Bin", r.get("Location", "-"))))
+        type_val = html.escape(str(r.get("Storage Type", r.get("Storage_Type", "-"))))
         need_pick = r.get("Need to be Picked", 0)
-        pss_type_val = r.get("PSS Type", "-")
+        w004_stk = r.get("W004 Stock", 0)
+        status_val = str(r.get("Transfer Status", ""))
+        pss_type_val = html.escape(str(r.get("PSS Type", "-")))
+        safe_part_id = html.escape(str(r.get('Part ID', '')))
+        safe_part_name = html.escape(str(r.get('Part Name', ''))[:30])
+        safe_seq_cov = html.escape(str(r.get('Sequences Covered', '')))
+        safe_prio = html.escape(str(r.get('Priority', '')))
+
+        if w004_stk == 0 or "Out of Stock" in status_val:
+            row_bg, row_fg = "#fee2e2", "#991b1b"
+        elif (w004_stk < need_pick) or "Partial" in status_val:
+            row_bg, row_fg = "#fef9c3", "#854d0e"
+        else:
+            row_bg, row_fg = "#dcfce7", "#166534"
 
         html_rows += f"""
-        <tr>
+        <tr style="background-color: {row_bg}; color: {row_fg};">
             <td style="text-align: center;">{r['S No']}</td>
-            <td style="font-weight: bold; font-family: monospace;">{r.get('Part ID', '')}</td>
-            <td style="font-size: 10px;">{r.get('Part Name', '')[:30]}</td>
-            <td style="text-align: right; font-weight: bold; background: #dcfce7;">{need_pick}</td>
+            <td style="font-weight: bold; font-family: monospace;">{safe_part_id}</td>
+            <td style="font-size: 10px;">{safe_part_name}</td>
+            <td style="text-align: right; font-weight: bold;">{need_pick}</td>
             <td style="text-align: right;">{r.get('PSS Qty', '')}</td>
             <td style="text-align: center; font-weight: bold;">{r.get('To be picked PSS count', '')}</td>
-            <td style="text-align: right;">{r.get('W004 Stock', 0)}</td>
-            <td style="text-align: center; font-weight: bold; background: #fef08a;">{pss_type_val}</td>
-            <td style="text-align: center; font-weight: bold; background: #e0f2fe;">{bin_val}</td>
+            <td style="text-align: right; font-weight: bold;">{w004_stk}</td>
+            <td style="text-align: center; font-weight: bold;">{pss_type_val}</td>
+            <td style="text-align: center; font-weight: bold;">{bin_val}</td>
             <td style="text-align: center;">{type_val}</td>
-            <td style="color: {prio_color}; font-weight: bold;">{r.get('Priority', '')}</td>
+            <td style="color: {prio_color}; font-weight: bold;">{safe_prio}</td>
             <td style="text-align: center;">{r.get('Starvation Mins', 0)}m</td>
-            <td style="font-size: 9px;">{r.get('Sequences Covered', '')}</td>
+            <td style="font-size: 9px;">{safe_seq_cov}</td>
         </tr>
         """
+
+    safe_sheet_title = html.escape(sheet_title)
 
     print_html_launcher = f"""
     <!DOCTYPE html>
@@ -2371,11 +3053,11 @@ def render_landscape_printable_view(df_subset: pd.DataFrame, sheet_title: str):
         </div>
         <button onclick="
             var printWin = window.open('', '', 'width=1100,height=800');
-            printWin.document.write('<html><head><title>{sheet_title}</title>');
+            printWin.document.write('<html><head><title>{safe_sheet_title}</title>');
             printWin.document.write('<style>@page {{ size: landscape; margin: 8mm; }} table {{ width:100%; border-collapse:collapse; font-size:10px; font-family:Arial; }} th, td {{ border:1px solid #94a3b8; padding:4px; }} th {{ background:#0f172a; color:#fff; }}</style>');
             printWin.document.write('</head><body>');
             printWin.document.write('<div style=\\'display:flex; justify-content:space-between; border-bottom:2px solid #00c853; padding-bottom:4px; margin-bottom:8px;\\'>');
-            printWin.document.write('<div><b style=\\'font-size:16px; color:#00c853;\\'>⚡ ATHER</b> <b>{sheet_title}</b></div>');
+            printWin.document.write('<div><b style=\\'font-size:16px; color:#00c853;\\'>⚡ ATHER</b> <b>{safe_sheet_title}</b></div>');
             printWin.document.write('<div>Total SKUs: {len(df_print)} | Date: ' + new Date().toLocaleDateString() + '</div></div>');
             printWin.document.write(document.getElementById('{table_id}').innerHTML);
             printWin.document.write('</body></html>');
@@ -2390,8 +3072,8 @@ def render_landscape_printable_view(df_subset: pd.DataFrame, sheet_title: str):
     </html>
     """
     
-    # Tiny 45px launcher button (eliminates 100% of iframe overhead)
     st.components.v1.html(print_html_launcher, height=45)
+
 # ---------------------------------------------------------
 # 4 CORE TABS
 # ---------------------------------------------------------
@@ -2405,16 +3087,12 @@ tab_sequence, tab_pickers, tab_deo_dock, tab_band2 = st.tabs([
 # ---------------------------------------------------------
 # TAB 1: SCALEX PLAN
 # ---------------------------------------------------------
-# ---------------------------------------------------------
-# TAB 1: SCALEX PLAN (UNALTERED SCREEN + NEW PICKLIST COLUMN)
-# ---------------------------------------------------------
 with tab_sequence:
     st.subheader("📈 ScaleX Plan Sequence (Exact MES Mirror)")
     st.caption("Direct 1:1 reflection of the ScaleX Production Sequence Report from 192.168.201.248. Untouched conveyor order.")
 
     scalex_raw = batches_df.copy()
 
-    # Determine "In Current Picklist" status for each row
     def check_in_picklist(row):
         st_val = str(row.get("Status", "")).upper()
         if st_val == "HOLD":
@@ -2429,7 +3107,6 @@ with tab_sequence:
 
     scalex_raw["In Current Picklist"] = scalex_raw.apply(check_in_picklist, axis=1)
 
-    # Added 'In Current Picklist' right next to Seq #
     col_order = ["ScaleX_Sequence_No", "In Current Picklist", "SKUName", "Status", "Line", "Serial_Start", "Serial_End", "Count"]
     display_scalex = scalex_raw[[c for c in col_order if c in scalex_raw.columns]].copy()
     display_scalex.rename(columns={
@@ -2449,7 +3126,6 @@ with tab_sequence:
         if "HOLD" in st_val:
             return ["background-color: #fee2e2; color: #991b1b; font-weight: bold;"] * len(row)
         elif "Cutoff" in p_val:
-            # Clear highlighted boundary row for the last sequence of the entered quantity
             return ["background-color: #fef08a; color: #854d0e; font-weight: bold;"] * len(row)
         elif "YES" in p_val:
             return ["background-color: #f0fdf4; color: #166534; font-weight: bold;"] * len(row)
@@ -2483,9 +3159,7 @@ with tab_sequence:
 
     with sx_tab_all:
         st.dataframe(display_scalex.style.apply(highlight_scalex, axis=1), use_container_width=True, hide_index=True)
-# ---------------------------------------------------------
-# TAB 2: OPERATOR PICKLIST
-# ---------------------------------------------------------
+
 # ---------------------------------------------------------
 # TAB 2: OPERATOR PICKLIST
 # ---------------------------------------------------------
@@ -2516,7 +3190,8 @@ with tab_pickers:
                 "PSS Type": pickable_df["PSS Type"],
                 "Priority": pickable_df["Priority"],
                 "Starvation Mins": pickable_df["Starvation_Mins"],
-                "Sequences Covered": pickable_df["Sequences_Covered"]
+                "Sequences Covered": pickable_df["Sequences_Covered"],
+                "Transfer Status": pickable_df.get("Transfer Status", pd.Series(["-"] * len(pickable_df)))
             }).sort_values(by=["Starvation Mins", "Storage Bin"], ascending=[True, True]).reset_index(drop=True)
 
             picker_workloads = split_picklist_by_equipment(picklist_display, num_pickers)
@@ -2544,26 +3219,15 @@ with tab_pickers:
         st.markdown("### 📊 Band 2 Live Snapshot")
         side_b2 = view_df[["Part ID", "Total M002 Pipeline", "W004 Stock", "Need to be Picked", "Transfer Status"]].copy()
         side_b2.columns = ["SKU", "Pipeline", "W004", "Transfer", "Status"]
+        st.dataframe(side_b2.style.apply(apply_band2_row_styles, axis=1), height=550, use_container_width=True, hide_index=True)
 
-        def highlight_side(row):
-            if "Out of Stock" in str(row["Status"]): return ["background-color: #fee2e2; color: #991b1b;"] * len(row)
-            elif "Ready" in str(row["Status"]): return ["background-color: #dcfce7; color: #166534;"] * len(row)
-            elif "Covered" in str(row["Status"]): return ["background-color: #e0f2fe; color: #0369a1;"] * len(row)
-            return [""] * len(row)
-
-        st.dataframe(side_b2.style.apply(highlight_side, axis=1), height=550, use_container_width=True, hide_index=True)
 # ---------------------------------------------------------
 # TAB 3: DEO LOADING & SAP DESK
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# TAB 3: DEO LOADING & SAP DESK (ISOLATED INSTANT SCANNER)
 # ---------------------------------------------------------
 with tab_deo_dock:
     st.subheader("🚚 DEO Dock Loading & Instant SAP Desk")
     st.caption("Scan SU barcodes on pallets/boxes or Part ID barcodes on trolleys. Zero-delay execution.")
 
-    # @st.fragment ensures ONLY this dock desk reruns when a barcode is scanned!
-    # The rest of the page, scroll position, and tabs do NOT reload!
     @st.fragment
     def render_instant_dock_desk():
         def process_su_scan():
@@ -2578,14 +3242,11 @@ with tab_deo_dock:
                 st.error("⚠️ LX02 file not loaded. Upload LX02 in the sidebar first.")
                 return
 
-            # Check for Duplicate Scans
             existing_records = get_scanned_records()
             if not existing_records.empty and (raw_su in existing_records["su_number"].values or raw_val in existing_records["su_number"].values):
                 st.warning(f"⚠️ Already Scanned: '{raw_val}' is already recorded on this truck!")
-                st.session_state["su_input_box"] = ""
                 return
 
-            # 1. Match by SU Number (Pallets / FLCs)
             su_match = clean_lx02_df[clean_lx02_df["SU_Number_Clean"] == raw_su]
 
             if not su_match.empty:
@@ -2598,7 +3259,6 @@ with tab_deo_dock:
                 save_scanned_su(raw_su, mat_id, desc, bin_loc, qty)
                 st.toast(f"✅ Loaded SU #{raw_su} | {mat_id} (Qty: {qty})", icon="📦")
             else:
-                # 2. Match by Part ID (Trolleys / Non-SU Parts)
                 mat_match = clean_lx02_df[clean_lx02_df["Material"].apply(clean_sap_key) == raw_mat]
                 if not mat_match.empty:
                     item = mat_match.iloc[0]
@@ -2612,8 +3272,6 @@ with tab_deo_dock:
                     st.toast(f"🛒 Loaded Trolley | {mat_id} (Qty: {trolley_qty} {pss_type})", icon="🚚")
                 else:
                     st.error(f"❌ SU Label not registered! (Scanned: '{raw_val}')")
-
-            st.session_state["su_input_box"] = ""
 
         st.text_input(
             "⚡ Focus here with Barcode Scanner (Scanner auto-presses Enter):",
@@ -2647,7 +3305,7 @@ with tab_deo_dock:
 
                 btn_c1, btn_c2 = st.columns(2)
                 if btn_c1.button("💾 Save Edits"):
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with get_db_connection() as conn:
                         edited_loading_df.to_sql("truck_loading", conn, if_exists="replace", index=False)
                     st.success("Manifest saved!")
 
@@ -2672,8 +3330,8 @@ with tab_deo_dock:
             else:
                 st.info("SAP transfer table will build automatically as SUs are scanned.")
 
-    # Call the isolated fragment
     render_instant_dock_desk()
+
 # ---------------------------------------------------------
 # TAB 4: BAND 2 REQUIREMENTS
 # ---------------------------------------------------------
@@ -2696,12 +3354,6 @@ with tab_band2:
         "W004 Stock": "W004 Stock"
     }, inplace=True)
 
-    def highlight_status(row):
-        if "Out of Stock" in str(row["Transfer Status"]): return ["background-color: #fee2e2; color: #991b1b; font-weight: bold;"] * len(row)
-        elif "Ready" in str(row["Transfer Status"]): return ["background-color: #dcfce7; color: #166534; font-weight: bold;"] * len(row)
-        elif "Covered" in str(row["Transfer Status"]): return ["background-color: #e0f2fe; color: #0369a1; font-weight: bold;"] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(transfer_table.style.apply(highlight_status, axis=1), use_container_width=True, hide_index=True)
+    st.dataframe(transfer_table.style.apply(apply_band2_row_styles, axis=1), use_container_width=True, hide_index=True)
     csv_band2 = transfer_table.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download Band 2 CSV", data=csv_band2, file_name="Band2_Transfer_Requirements.csv", mime="text/csv")
