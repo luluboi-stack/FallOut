@@ -79,6 +79,8 @@ def _render_bom(feeds: PageFeeds) -> None:
 
 def _render_stock(feeds: PageFeeds) -> None:
     st.caption(TOOL_EQUATION)
+    if feeds.stock_table:
+        st.caption(f"Unrestricted stock from {feeds.stock_table}.")
     if feeds.stock_error:
         st.error(feeds.stock_error)
     if feeds.cogi_error:

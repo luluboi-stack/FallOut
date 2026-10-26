@@ -13,6 +13,7 @@ from live_stock import (
     COGI_TABLE_FALLBACK,
     EKKO_TABLE,
     MARD_TABLE,
+    MARD_TABLE_FALLBACK,
     StockTables,
     WALK_PARENT_PREFIXES,
     build_cogi_sql,
@@ -24,6 +25,7 @@ from live_stock import (
     load_bom_frame,
     load_cogi_frame,
     load_demo_feeds,
+    load_stock_frame,
     tool_quantities,
 )
 
@@ -247,6 +249,40 @@ def test_open_sto_sql_uses_received_quantity_not_ordered_quantity():
         )
 
 
+def test_stock_describe_falls_back_when_mard_is_absent(monkeypatch):
+    calls = []
+
+    def describe(_conn, table):
+        calls.append(table)
+        if table == MARD_TABLE:
+            raise DataSourceError(
+                "[TABLE_OR_VIEW_NOT_FOUND] The table or view sap.sapabap1.mard cannot be found."
+            )
+        if table == MARD_TABLE_FALLBACK:
+            return ["matnr", "werks", "lgort", "labst", "insme", "speme"]
+        raise DataSourceError(table)
+
+    def query(_conn, sql):
+        assert "nsdm_v_mard_hourly" in sql
+        assert "`labst`" in sql
+        assert "insme" not in sql.lower()
+        return pd.DataFrame(
+            {
+                "Material": ["P"],
+                "Plant": ["M002"],
+                "Storage Location": ["PV01"],
+                "Unrestricted": [5],
+            }
+        )
+
+    monkeypatch.setattr(bom_databricks, "_describe", describe)
+    monkeypatch.setattr(bom_databricks, "_query", query)
+    frame, used = load_stock_frame(object(), (MARD_TABLE, MARD_TABLE_FALLBACK))
+    assert used == MARD_TABLE_FALLBACK
+    assert calls == [MARD_TABLE, MARD_TABLE_FALLBACK]
+    assert frame["Unrestricted"].iloc[0] == 5
+
+
 def test_cogi_describe_falls_back_only_when_affw_is_absent(monkeypatch):
     calls = []
 
@@ -330,10 +366,10 @@ def test_stock_table_names_follow_env():
             "DATABRICKS_COGI_TABLE": "sap.sapabap1.affw_custom",
         }
     )
-    assert custom.mard_table == "sap.sapabap1.mard_custom"
+    assert custom.mard_tables == ("sap.sapabap1.mard_custom",)
     assert custom.cogi_tables == ("sap.sapabap1.affw_custom",)
     defaults = StockTables.resolve(environ={})
-    assert defaults.mard_table == MARD_TABLE
+    assert defaults.mard_tables == (MARD_TABLE, MARD_TABLE_FALLBACK)
     assert defaults.cogi_tables == (COGI_TABLE, COGI_TABLE_FALLBACK)
     assert defaults.ekko_table == EKKO_TABLE
 

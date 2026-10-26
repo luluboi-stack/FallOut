@@ -30,6 +30,8 @@ from bom_databricks import (
 
 # Unrestricted storage-location stock (MARD-LABST). Env: DATABRICKS_MARD_TABLE.
 MARD_TABLE = "sap.sapabap1.mard"
+# Stock balance view used when MARD is absent from this catalog. Same labst column.
+MARD_TABLE_FALLBACK = "sap.sapabap1.nsdm_v_mard_hourly"
 # COGI failed goods movements (AFFW). Env: DATABRICKS_COGI_TABLE.
 COGI_TABLE = "sap.sapabap1.affw"
 # Hourly COGI extract, queried only after AFFW DESCRIBE fails. Env override replaces both.
@@ -83,7 +85,7 @@ def clean_sap_key(val: Any) -> str:
 
 @dataclass(frozen=True)
 class StockTables:
-    mard_table: str
+    mard_tables: tuple[str, ...]
     cogi_tables: tuple[str, ...]
     ekko_table: str
     ekpo_table: str
@@ -99,8 +101,10 @@ class StockTables:
 
         cogi_override = str(env.get("DATABRICKS_COGI_TABLE", "") or "").strip()
         cogi_tables = (cogi_override,) if cogi_override else (COGI_TABLE, COGI_TABLE_FALLBACK)
+        mard_override = str(env.get("DATABRICKS_MARD_TABLE", "") or "").strip()
+        mard_tables = (mard_override,) if mard_override else (MARD_TABLE, MARD_TABLE_FALLBACK)
         return cls(
-            mard_table=pick("DATABRICKS_MARD_TABLE", MARD_TABLE),
+            mard_tables=mard_tables,
             cogi_tables=cogi_tables,
             ekko_table=pick("DATABRICKS_EKKO_TABLE", EKKO_TABLE),
             ekpo_table=pick("DATABRICKS_EKPO_TABLE", EKPO_TABLE),
@@ -119,6 +123,7 @@ class PageFeeds:
     sto: pd.DataFrame
     sto_error: Optional[str]
     demo: bool
+    stock_table: Optional[str] = None
 
 
 def empty_stock() -> pd.DataFrame:
@@ -539,9 +544,21 @@ def load_bom_frame(conn: Any, settings: DatabricksSettings) -> pd.DataFrame:
     return bom_table(bom_databricks._query(conn, sql))
 
 
-def load_stock_frame(conn: Any, table: str) -> pd.DataFrame:
-    columns = bom_databricks._describe(conn, table)
-    return bom_databricks._query(conn, build_stock_sql(table, columns))
+def load_stock_frame(conn: Any, tables: Sequence[str]) -> tuple[pd.DataFrame, str]:
+    """DESCRIBE each stock candidate and query the first table that exists."""
+    if not tables:
+        raise DataSourceError("No stock table configured")
+    errors: list[str] = []
+    for table in tables:
+        try:
+            columns = bom_databricks._describe(conn, table)
+        except DataSourceError as exc:
+            if not _table_absent(exc):
+                raise
+            errors.append(f"{table}: {exc}")
+            continue
+        return bom_databricks._query(conn, build_stock_sql(table, columns)), table
+    raise DataSourceError("Stock table is not in the catalog. " + " | ".join(errors))
 
 
 def _table_absent(exc: BaseException) -> bool:
@@ -647,9 +664,15 @@ def load_live_feeds(
         return _failed_feeds(str(exc))
     with connection as conn:
         bom, bom_error = _one(lambda: load_bom_frame(conn, resolved), empty_bom())
-        stock, stock_error = _one(
-            lambda: load_stock_frame(conn, stock_tables.mard_table), empty_stock()
-        )
+        stock = empty_stock()
+        stock_error = None
+        stock_table = None
+        try:
+            stock, stock_table = load_stock_frame(conn, stock_tables.mard_tables)
+        except DataSourceError as exc:
+            stock_error = str(exc)
+        except Exception as exc:
+            stock_error = str(exc)
         cogi, cogi_error = _one(
             lambda: load_cogi_frame(conn, stock_tables.cogi_tables)[0], empty_cogi()
         )
@@ -664,4 +687,5 @@ def load_live_feeds(
         sto=sto,
         sto_error=sto_error,
         demo=False,
+        stock_table=stock_table,
     )
