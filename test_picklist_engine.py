@@ -106,9 +106,9 @@ def test_opening_stock_columns_are_distinct_and_walk_uses_combined_plant():
     for _, row in rows.iterrows():
         assert {k: row[k] for k in expected} == expected
     first, second = rows.iloc[0], rows.iloc[1]
-    assert first["plant_opening"] == 15
-    assert (first["plant_taken"], first["sto_taken"], first["trigger"]) == (15, 5, 10)
-    assert (second["plant_taken"], second["sto_taken"], second["trigger"]) == (0, 0, 30)
+    assert first["plant_opening"] == 28
+    assert (first["plant_taken"], first["sto_taken"], first["trigger"]) == (28, 2, 0)
+    assert (second["plant_taken"], second["sto_taken"], second["trigger"]) == (0, 3, 27)
     assert first["w004_taken"] == first["trigger"]
 
 

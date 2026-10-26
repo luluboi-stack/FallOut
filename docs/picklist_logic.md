@@ -7,7 +7,7 @@ One walk runs right after each SAP pull (MB52, COGI, STO) or ScaleX plan change.
 1. Sequences: ScaleX batches with `Status == "PLAN"` (HOLD is never walked), ordered by `ScaleX_Sequence_No`, then line. Both lines draw from the same balance per material.
 2. Each sequence is exploded to materials with the app's BOM recursion. A child listed in `OFFICIAL_PSS_MASTER` is a handled unit and is not dissolved. Need = unit qty × batch count.
 3. Balance per material, set once:
-   - plant = max(0, M002 RM01 + PS01 − COGI)
+   - plant = max(0, M002 RM01 + PS01 + PV01 − COGI). PV01 is floor stock only. The pick still comes from W004 RM01.
    - sto = open STO (W004 ➡️ M002)
    - w004 = W004 RM01
    COGI is not used again inside the loop.
@@ -18,7 +18,7 @@ One walk runs right after each SAP pull (MB52, COGI, STO) or ScaleX plan change.
    - RED: need still unmet and w004 was already 0, trigger 0
 5. One row per sequence per material is stored in `picklist_walk`, with and without a trigger.
 
-Each `picklist_walk` row also carries the part's opening amounts for that walk: `m002_rm01`, `m002_ps01`, `m002_pv01`, `w004_rm01`, `sto`, and `cogi`. They are the same on every sequence row of the part. They are stored for audit only and do not change the subtraction order: the walk still spends one plant bucket max(0, RM01 + PS01 − COGI), then STO, then W004 RM01. PV01 is never spent.
+Each `picklist_walk` row also carries the part's opening amounts for that walk: `m002_rm01`, `m002_ps01`, `m002_pv01`, `w004_rm01`, `sto`, and `cogi`. They are the same on every sequence row of the part. The walk spends one plant bucket max(0, RM01 + PS01 + PV01 − COGI), then STO, then W004 RM01. PV01 reduces that floor bucket. It is not a pick source: the trigger is still only the W004 RM01 take (`pv01_floor.py`).
 
 Not in the walk: the 30-piece buffer, `preceding_drain`, `classify_material_decision`, the Experimental Additive mode, and any time-based cutoff.
 

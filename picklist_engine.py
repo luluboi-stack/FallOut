@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 
+from pv01_floor import opening_floor, pss_round, take_floor_sto_w004
+
 COVERED = "COVERED"
 TRIGGERED = "TRIGGERED"
 PARTIAL = "PARTIAL"
@@ -78,13 +80,7 @@ def _ceil(x: float) -> int:
 
 def pick_quantity(trigger_sum: float, pss_qty: int) -> Tuple[int, int]:
     """Returns (pick qty, box count): ceil(sum / PSS) * PSS, or 0 when nothing triggered."""
-    if trigger_sum <= EPS:
-        return 0, 0
-    if pss_qty <= 0:
-        qty = _ceil(trigger_sum)
-        return qty, qty
-    boxes = _ceil(trigger_sum / pss_qty)
-    return boxes * pss_qty, boxes
+    return pss_round(trigger_sum, pss_qty)
 
 
 @dataclass
@@ -111,10 +107,16 @@ class StockBalances:
         open_pos: Optional[Dict[str, str]] = None,
         m002_pv01: Optional[Dict[str, float]] = None,
     ) -> "StockBalances":
-        """plant = max(0, RM01 + PS01 - COGI). PV01 is stored but never spent."""
-        keys = set(m002_rm01) | set(m002_ps01) | set(cogi)
-        m002 = {k: float(m002_rm01.get(k, 0.0)) + float(m002_ps01.get(k, 0.0)) for k in keys}
-        plant = {k: max(0.0, m002[k] - float(cogi.get(k, 0.0))) for k in keys}
+        """plant = max(0, RM01 + PS01 + PV01 - COGI). PV01 is floor stock, never a pick."""
+        pv01 = m002_pv01 or {}
+        keys = set(m002_rm01) | set(m002_ps01) | set(pv01) | set(cogi)
+        m002 = {}
+        plant = {}
+        for key in keys:
+            rm01 = float(m002_rm01.get(key, 0.0))
+            ps01 = float(m002_ps01.get(key, 0.0))
+            m002[key] = rm01 + ps01
+            plant[key] = opening_floor(rm01, ps01, float(pv01.get(key, 0.0)), float(cogi.get(key, 0.0)))
         return cls(
             plant=plant,
             sto={k: float(v) for k, v in sto.items()},
@@ -271,15 +273,10 @@ def walk_sequences(
                 "cogi": balances.cogi.get(key, 0.0),
             }
         bal = remaining[key]
-        rest = r.need
-        taken = []
-        for i in range(3):
-            t = min(rest, bal[i])
-            bal[i] -= t
-            rest -= t
-            taken.append(t)
-        plant_taken, sto_taken, w004_taken = taken
-        shortfall = rest if rest > EPS else 0.0
+        step = take_floor_sto_w004(r.need, bal[0], bal[1], bal[2])
+        bal[0], bal[1], bal[2] = step.floor_after, step.sto_after, step.w004_after
+        plant_taken, sto_taken, w004_taken = step.floor_taken, step.sto_taken, step.w004_taken
+        shortfall = step.shortfall
 
         if shortfall > 0:
             status = PARTIAL if w004_taken > EPS else RED
