@@ -32,6 +32,7 @@ from live_stock import (
     empty_sto,
     load_demo_feeds,
     load_live_feeds,
+    material_quantities,
     tool_quantities,
 )
 
@@ -52,12 +53,16 @@ def _show_frame(frame: pd.DataFrame, empty_note: str) -> None:
     st.caption(f"{len(frame)} rows")
 
 
-def _equation(feeds: PageFeeds) -> pd.DataFrame | None:
+def _quantities(feeds: PageFeeds) -> pd.DataFrame | None:
+    """Every material's quantity. Blank when unrestricted stock did not load, so a 0 is never a stand-in for a failed read."""
     if feeds.stock_error:
         return None
     cogi = feeds.cogi if not feeds.cogi_error else empty_cogi()
     sto = feeds.sto if not feeds.sto_error else empty_sto()
-    frame = tool_quantities(feeds.stock, cogi, sto)
+    if feeds.bom_error:
+        frame = tool_quantities(feeds.stock, cogi, sto)
+    else:
+        frame = material_quantities(feeds.bom, feeds.stock, cogi, sto)
     if feeds.cogi_error:
         frame = frame.copy()
         frame["cogi"] = pd.NA
@@ -90,10 +95,15 @@ def _render_stock(feeds: PageFeeds) -> None:
         st.error(f"COGI: {feeds.cogi_error}")
     if feeds.sto_error:
         st.error(f"Open STO: {feeds.sto_error}")
-    equation = _equation(feeds)
+    equation = _quantities(feeds)
     if equation is not None:
-        st.subheader("Unrestricted, COGI, and open STO")
-        _show_frame(equation, "No unrestricted stock, COGI, or open STO rows.")
+        st.subheader("Quantity of every material")
+        st.caption(
+            "Unrestricted labst from the latest stock load. "
+            "m002_raw is M002 RM01 + PS01 + PV01. w004_rm01 is W004 RM01. "
+            "A material with no stock row is 0."
+        )
+        _show_frame(equation, "No materials.")
     if not feeds.cogi_error:
         st.subheader("COGI")
         _show_frame(feeds.cogi, "No COGI rows for plant M002.")
@@ -135,9 +145,21 @@ def _render_checker(feeds: PageFeeds) -> None:
             return None
         return checks[name]
 
+    quantities = _quantities(feeds)
+    st.subheader("Quantity of every material")
+    st.caption(
+        "The quantity of each material. m002_raw and w004_rm01 are unrestricted stock. "
+        "open_sto is the open W004 to M002 quantity. cogi is the M002 failed-goods quantity. "
+        "0 means that feed has no row for the material."
+    )
+    if feeds.stock_error:
+        st.error(stock_problem)
+    else:
+        _show_frame(quantities if quantities is not None else pd.DataFrame(), "No materials.")
+
     _section(
         "On the BOM, no unrestricted stock",
-        "No unrestricted quantity in M002 RM01, PS01, and PV01, and none in W004 RM01. Zero COGI is not a missing part.",
+        "Only the BOM parts whose unrestricted quantity is 0 in M002 RM01, PS01, PV01, and W004 RM01. Parts with stock are in the quantity table above. Zero COGI does not put a part on this list.",
         take("missing_unrestricted"),
         stock_problem,
     )

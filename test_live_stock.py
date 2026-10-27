@@ -27,6 +27,7 @@ from live_stock import (
     load_cogi_frame,
     load_demo_feeds,
     load_stock_frame,
+    material_quantities,
     tool_quantities,
 )
 
@@ -61,6 +62,7 @@ def test_pv01_unrestricted_counts_in_m002_bucket():
     assert "`labst`" in sql
     assert "insme" not in sql.lower()
     assert "speme" not in sql.lower()
+    assert "MAX(" not in sql
     assert "'PV01'" in sql and "'PS01'" in sql and "'RM01'" in sql
     assert "'M002'" in sql and "'W004'" in sql
     with pytest.raises(DataSourceError, match="labst"):
@@ -91,6 +93,48 @@ def test_pv01_unrestricted_counts_in_m002_bucket():
 
     heavy = tool_quantities(stock, pd.DataFrame({"Material": ["P"], "Quantity": [100]}), empty_sto())
     assert heavy.set_index("Material").loc["P", "m002_effective"] == 0
+
+
+def test_hourly_stock_uses_the_latest_load_only():
+    sql = build_stock_sql(
+        "sap.sapabap1.nsdm_v_mard_hourly",
+        MARD_COLS + ["load_timestamp", "insme"],
+    )
+    assert "MAX(`load_timestamp`)" in sql
+    assert "`labst`" in sql
+    assert "insme" not in sql.lower()
+    assert "speme" not in sql.lower()
+
+
+def test_quantity_of_every_material_keeps_the_true_balance():
+    bom = pd.DataFrame(
+        {
+            "Walk SKU": ["S450X", "S450X"],
+            "Parent Material": ["S450X", "S450X"],
+            "Child Material": ["0000HAS", "NONE"],
+        }
+    )
+    stock = pd.DataFrame(
+        [
+            _stock_row("HAS", "M002", "RM01", "1,250"),
+            _stock_row("HAS", "M002", "PV01", 4),
+            _stock_row("HAS", "W004", "RM01", 7),
+        ]
+    )
+    sto = pd.DataFrame({"Material": ["HAS"], "Open Qty": ["1,500"]})
+    report = material_quantities(bom, stock, empty_cogi(), sto)
+    indexed = report.set_index("Material")
+    has = indexed.loc["HAS"]
+    assert has["M002 RM01"] == 1250
+    assert has["M002 PV01"] == 4
+    assert has["m002_raw"] == 1254
+    assert has["w004_rm01"] == 7
+    assert has["open_sto"] == 1500
+    assert has["Walk SKU"] == "S450X"
+    assert indexed.loc["NONE", "m002_raw"] == 0
+    assert indexed.loc["NONE", "open_sto"] == 0
+    missing = compare_bom_stock(bom, stock, empty_cogi(), sto)["missing_unrestricted"]
+    assert missing["Material"].tolist() == ["NONE"]
 
 
 def test_bom_part_with_all_unrestricted_buckets_zero_is_missing():

@@ -18,13 +18,13 @@ from bom_databricks import (
     BOM_COLUMNS,
     DataSourceError,
     DatabricksSettings,
-    _aliased_number,
     _aliased_text,
     _require_column,
     bom_table,
     build_bom_sql,
     databricks_connect_kwargs,
     find_column,
+    quote_column,
     quote_table,
 )
 
@@ -32,6 +32,14 @@ from bom_databricks import (
 MARD_TABLE = "sap.sapabap1.mard"
 # Stock balance view used when MARD is absent from this catalog. Same labst column.
 MARD_TABLE_FALLBACK = "sap.sapabap1.nsdm_v_mard_hourly"
+# Hourly copies repeat the balance. The true quantity is the latest load, not the sum of every hour.
+STOCK_SNAPSHOT_COLUMNS = (
+    "load_timestamp",
+    "snapshot_ts",
+    "ingestion_timestamp",
+    "di_sequence_number",
+    "calday",
+)
 # COGI failed goods movements (AFFW). Env: DATABRICKS_COGI_TABLE.
 COGI_TABLE = "sap.sapabap1.affw"
 # Hourly COGI extract, queried only after AFFW DESCRIBE fails. Env override replaces both.
@@ -139,6 +147,13 @@ def empty_bom() -> pd.DataFrame:
     return pd.DataFrame(columns=BOM_COLUMNS)
 
 
+def _qty_sql(alias: str, column: str) -> str:
+    """Numeric quantity. Thousands commas are removed so a string balance is not read as zero."""
+    text = _aliased_text(alias, column)
+    cleaned = f"REGEXP_REPLACE({text}, ',', '')"
+    return f"CAST({cleaned} AS DOUBLE)"
+
+
 def build_stock_sql(table: str, columns: Sequence[str]) -> str:
     """Unrestricted labst for the M002 floor buckets and W004 RM01."""
     matnr = _require_column(columns, "matnr")
@@ -159,14 +174,20 @@ def build_stock_sql(table: str, columns: Sequence[str]) -> str:
         f" OR (UPPER({plant}) = 'W004' AND UPPER({sloc}) = '{W004_SLOC}')"
     )
     material = _aliased_text("s", matnr)
+    snap = find_column(columns, *STOCK_SNAPSHOT_COLUMNS)
+    snapshot_filter = ""
+    if snap:
+        snapshot_filter = (
+            f"s.{quote_column(snap)} = (SELECT MAX({quote_column(snap)}) FROM {quote_table(table)}) AND "
+        )
     return f"""
         SELECT
             {material} AS `Material`,
             {plant} AS `Plant`,
             {sloc} AS `Storage Location`,
-            SUM({_aliased_number("s", labst)}) AS `Unrestricted`
+            SUM({_qty_sql("s", labst)}) AS `Unrestricted`
         FROM {quote_table(table)} s
-        WHERE {where}
+        WHERE {snapshot_filter}({where})
         GROUP BY {material}, {plant}, {sloc}
     """
 
@@ -185,7 +206,7 @@ def build_cogi_sql(table: str, columns: Sequence[str]) -> str:
     return f"""
         SELECT
             {material} AS `Material`,
-            SUM({_aliased_number("c", qty)}) AS `Quantity`
+            SUM({_qty_sql("c", qty)}) AS `Quantity`
         FROM {quote_table(table)} c
         WHERE UPPER({_aliased_text("c", werks)}) = 'M002'
             AND {material} <> ''
@@ -232,8 +253,8 @@ def _open_qty_expr(alias: str, columns: Sequence[str]) -> str:
             "Ordered quantity alone is not used."
         )
     return (
-        f"GREATEST({_aliased_number(alias, menge)} - "
-        f"COALESCE({_aliased_number(alias, wemng)}, 0), 0)"
+        f"GREATEST({_qty_sql(alias, menge)} - "
+        f"COALESCE({_qty_sql(alias, wemng)}, 0), 0)"
     )
 
 
@@ -318,6 +339,12 @@ def _frame_column(frame: pd.DataFrame, *names: str) -> Optional[str]:
     return None
 
 
+def _to_qty(series: pd.Series) -> pd.Series:
+    text = series.astype(str).str.replace(",", "", regex=False).str.strip()
+    text = text.replace({"": "0", "None": "0", "nan": "0", "NaN": "0"})
+    return pd.to_numeric(text, errors="coerce").fillna(0.0)
+
+
 def _sum_by_material(frame: pd.DataFrame, *qty_names: str) -> pd.Series:
     if frame is None or frame.empty:
         return pd.Series(dtype=float)
@@ -328,7 +355,7 @@ def _sum_by_material(frame: pd.DataFrame, *qty_names: str) -> pd.Series:
             "Expected a material column and one of: " + ", ".join(qty_names)
         )
     keys = frame[mat_col].map(clean_sap_key)
-    values = pd.to_numeric(frame[qty_col], errors="coerce").fillna(0.0)
+    values = _to_qty(frame[qty_col])
     grouped = values.groupby(keys).sum()
     return grouped[grouped.index != ""]
 
@@ -351,7 +378,7 @@ def unrestricted_buckets(stock: pd.DataFrame) -> pd.DataFrame:
             "Material": stock[mat_col].map(clean_sap_key),
             "Plant": stock[plant_col].astype(str).str.strip().str.upper(),
             "SLoc": stock[sloc_col].astype(str).str.strip().str.upper(),
-            "Qty": pd.to_numeric(stock[qty_col], errors="coerce").fillna(0.0),
+            "Qty": _to_qty(stock[qty_col]),
         }
     )
     work = work[work["Material"] != ""]
@@ -416,6 +443,38 @@ def tool_quantities(stock: pd.DataFrame, cogi: pd.DataFrame, sto: pd.DataFrame) 
             }
         )
     return pd.DataFrame(rows, columns=EQUATION_COLUMNS)
+
+
+def material_quantities(
+    bom: pd.DataFrame,
+    stock: pd.DataFrame,
+    cogi: pd.DataFrame,
+    sto: pd.DataFrame,
+) -> pd.DataFrame:
+    """True quantity of every BOM material, plus any material that has stock, COGI, or open STO.
+
+    A missing stock row is 0. That 0 is the warehouse balance, not a blank feed.
+    """
+    quantities = tool_quantities(stock, cogi, sto)
+    indexed = quantities.set_index("Material") if not quantities.empty else quantities
+    children, _on_bom = bom_material_keys(bom)
+    extra = set(quantities["Material"]) if not quantities.empty else set()
+    materials = sorted(set(children) | extra)
+    walk = _walk_skus_by_child(bom)
+    rows = []
+    for material in materials:
+        if not indexed.empty and material in indexed.index:
+            source = indexed.loc[material]
+            if isinstance(source, pd.DataFrame):
+                source = source.iloc[0]
+            values = {column: float(source[column]) for column in EQUATION_COLUMNS if column != "Material"}
+        else:
+            values = {column: 0.0 for column in EQUATION_COLUMNS if column != "Material"}
+        values["Material"] = material
+        values["Walk SKU"] = walk.get(material, "")
+        rows.append(values)
+    columns = ["Walk SKU", *EQUATION_COLUMNS]
+    return pd.DataFrame(rows, columns=columns)
 
 
 def explode_walk_bom(
