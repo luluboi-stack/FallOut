@@ -129,6 +129,7 @@ class PageFeeds:
     sto_error: Optional[str]
     demo: bool
     stock_table: Optional[str] = None
+    stock_period: Optional[str] = None
 
 
 def empty_stock() -> pd.DataFrame:
@@ -154,7 +155,54 @@ def _qty_sql(alias: str, column: str) -> str:
     return f"CAST({cleaned} AS DOUBLE)"
 
 
-def build_stock_sql(table: str, columns: Sequence[str]) -> str:
+_INDIA_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+def india_stamp(value: str) -> str:
+    """A timestamp written in India time: YYYY-MM-DD HH:MM:SS."""
+    text = str(value).strip()
+    if _INDIA_STAMP.match(text) is None:
+        raise DataSourceError(
+            "Stock time must be YYYY-MM-DD HH:MM:SS in India time, "
+            f"for example 2026-10-27 11:00:00. Got: {value}"
+        )
+    return text
+
+
+def _batch_instant_sql(
+    table: str,
+    snap: str,
+    period_start: Optional[str],
+    period_end: Optional[str],
+) -> str:
+    """One batch_ts only. A period keeps the latest batch inside that India-time window."""
+    column = quote_column(snap)
+    if period_start or period_end:
+        if not period_start or not period_end:
+            raise DataSourceError("Stock period needs both a start and an end.")
+        start = india_stamp(period_start)
+        end = india_stamp(period_end)
+        if start >= end:
+            raise DataSourceError("Stock period start must be before the end.")
+
+        def local(alias: str) -> str:
+            return (
+                f"from_utc_timestamp(CAST({alias}.{column} AS TIMESTAMP), 'Asia/Kolkata')"
+            )
+
+        window = f"{local('i')} >= TIMESTAMP '{start}' AND {local('i')} < TIMESTAMP '{end}'"
+        return (
+            f"s.{column} = (SELECT MAX(i.{column}) FROM {quote_table(table)} i WHERE {window}) AND "
+        )
+    return f"s.{column} = (SELECT MAX({column}) FROM {quote_table(table)}) AND "
+
+
+def build_stock_sql(
+    table: str,
+    columns: Sequence[str],
+    period_start: Optional[str] = None,
+    period_end: Optional[str] = None,
+) -> str:
     """Unrestricted labst for live M002 and W004 from the same stock table.
 
     M002 floor is RM01 + PS01 + PV01. W004 is RM01, the pick source.
@@ -178,11 +226,11 @@ def build_stock_sql(table: str, columns: Sequence[str]) -> str:
     )
     material = _aliased_text("s", matnr)
     snap = find_column(columns, *STOCK_SNAPSHOT_COLUMNS)
-    snapshot_filter = ""
-    if snap:
-        snapshot_filter = (
-            f"s.{quote_column(snap)} = (SELECT MAX({quote_column(snap)}) FROM {quote_table(table)}) AND "
+    if (period_start or period_end) and snap is None:
+        raise DataSourceError(
+            "This stock table has no batch_ts column, so a time period would mix every load together."
         )
+    snapshot_filter = _batch_instant_sql(table, snap, period_start, period_end) if snap else ""
     return f"""
         SELECT
             {material} AS `Material`,
@@ -680,7 +728,12 @@ def load_bom_frame(conn: Any, settings: DatabricksSettings) -> pd.DataFrame:
     return explode_walk_bom(bom_table(bom_databricks._query(conn, sql)))
 
 
-def load_stock_frame(conn: Any, tables: Sequence[str]) -> tuple[pd.DataFrame, str]:
+def load_stock_frame(
+    conn: Any,
+    tables: Sequence[str],
+    period_start: Optional[str] = None,
+    period_end: Optional[str] = None,
+) -> tuple[pd.DataFrame, str]:
     """DESCRIBE each stock candidate and query the first table that exists."""
     if not tables:
         raise DataSourceError("No stock table configured")
@@ -693,7 +746,9 @@ def load_stock_frame(conn: Any, tables: Sequence[str]) -> tuple[pd.DataFrame, st
                 raise
             errors.append(f"{table}: {exc}")
             continue
-        return bom_databricks._query(conn, build_stock_sql(table, columns)), table
+        return bom_databricks._query(
+            conn, build_stock_sql(table, columns, period_start, period_end)
+        ), table
     raise DataSourceError("Stock table is not in the catalog. " + " | ".join(errors))
 
 
@@ -785,8 +840,10 @@ def _failed_feeds(message: str) -> PageFeeds:
 def load_live_feeds(
     settings: Optional[DatabricksSettings] = None,
     tables: Optional[StockTables] = None,
+    period_start: Optional[str] = None,
+    period_end: Optional[str] = None,
 ) -> PageFeeds:
-    """One SSO connection. A missing table is an error on that feed only."""
+    """One SSO connection. Stock is one batch_ts, optionally inside an India-time period."""
     resolved = settings or DatabricksSettings.resolve()
     stock_tables = tables or StockTables.resolve()
     connector = bom_databricks.databricks_sql
@@ -804,7 +861,9 @@ def load_live_feeds(
         stock_error = None
         stock_table = None
         try:
-            stock, stock_table = load_stock_frame(conn, stock_tables.mard_tables)
+            stock, stock_table = load_stock_frame(
+                conn, stock_tables.mard_tables, period_start, period_end
+            )
         except DataSourceError as exc:
             stock_error = str(exc)
         except Exception as exc:
@@ -824,4 +883,9 @@ def load_live_feeds(
         sto_error=sto_error,
         demo=False,
         stock_table=stock_table,
+        stock_period=(
+            f"{india_stamp(period_start)} to {india_stamp(period_end)} India time"
+            if period_start and period_end
+            else "latest batch"
+        ),
     )

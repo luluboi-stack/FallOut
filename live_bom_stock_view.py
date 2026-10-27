@@ -19,6 +19,8 @@ from __future__ import annotations
 import os
 import sys
 
+from datetime import datetime, time, timedelta
+
 import pandas as pd
 import streamlit as st
 
@@ -76,9 +78,11 @@ def _render_stock(feeds: PageFeeds) -> None:
     else:
         st.caption("Live M002 and W004 unrestricted stock.")
     st.caption(
-        "One balance per material. This is not added across sequences and it is not limited to the walk. "
+        "One batch only. This is not added across hours or sequences, and it is not limited to the walk. "
         "M002 is RM01 + PS01 + PV01 unrestricted. W004 is RM01 unrestricted."
     )
+    if feeds.stock_period:
+        st.caption(feeds.stock_period)
     if feeds.stock_error:
         st.error(feeds.stock_error)
     else:
@@ -155,6 +159,20 @@ def _render_checker(feeds: PageFeeds) -> None:
     )
 
 
+def _period_inputs() -> tuple[str, str]:
+    """India-time window. The stock read keeps the single batch_ts inside it."""
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    st.sidebar.header("Stock time (India)")
+    start_day = st.sidebar.date_input("From date", value=now.date())
+    start_at = st.sidebar.time_input("From time", value=time(now.hour, 0))
+    end_default = now + timedelta(hours=1)
+    end_day = st.sidebar.date_input("To date", value=end_default.date())
+    end_at = st.sidebar.time_input("To time", value=time(end_default.hour, 0))
+    start = f"{start_day:%Y-%m-%d} {start_at:%H:%M:%S}"
+    end = f"{end_day:%Y-%m-%d} {end_at:%H:%M:%S}"
+    return start, end
+
+
 def page(demo: bool) -> None:
     st.set_page_config(page_title="Live BOM and stock", layout="wide")
     st.title("Live BOM and stock")
@@ -163,7 +181,13 @@ def page(demo: bool) -> None:
         feeds = load_demo_feeds()
     else:
         st.caption("Live SSO warehouse, same connection as the BOM viewer.")
-        feeds = load_live_feeds()
+        period_start, period_end = _period_inputs()
+        st.sidebar.caption("One batch_ts inside this window. Earlier hours are not added.")
+        if "live_feeds" not in st.session_state:
+            st.session_state.live_feeds = None
+        if st.sidebar.button("Load this period", type="primary") or st.session_state.live_feeds is None:
+            st.session_state.live_feeds = load_live_feeds(period_start=period_start, period_end=period_end)
+        feeds = st.session_state.live_feeds
     bom_tab, stock_tab = st.tabs(["BOM", "Stock"])
     with bom_tab:
         _render_bom(feeds)

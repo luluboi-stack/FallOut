@@ -94,6 +94,27 @@ def test_pv01_unrestricted_counts_in_m002_bucket():
     assert heavy.set_index("Material").loc["P", "m002_effective"] == 0
 
 
+def test_stock_period_keeps_one_batch_inside_the_hour():
+    sql = build_stock_sql(
+        "sap.sapabap1.nsdm_v_mard_hourly",
+        MARD_COLS + ["batch_ts", "insme"],
+        period_start="2026-10-27 11:00:00",
+        period_end="2026-10-27 12:00:00",
+    )
+    assert "TIMESTAMP '2026-10-27 11:00:00'" in sql
+    assert "TIMESTAMP '2026-10-27 12:00:00'" in sql
+    assert "Asia/Kolkata" in sql
+    assert "MAX(i.`batch_ts`)" in sql
+    assert "`labst`" in sql
+    assert "insme" not in sql.lower()
+    plain = build_stock_sql(
+        "sap.sapabap1.nsdm_v_mard_hourly",
+        MARD_COLS + ["batch_ts"],
+    )
+    assert "Asia/Kolkata" not in plain
+    assert "MAX(`batch_ts`)" in plain
+
+
 def test_hourly_stock_uses_the_latest_load_only():
     sql = build_stock_sql(
         "sap.sapabap1.nsdm_v_mard_hourly",
