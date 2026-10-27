@@ -307,16 +307,19 @@ def _is_blank(alias: str, column: str) -> str:
 
 
 def _open_qty_expr(alias: str, columns: Sequence[str]) -> str:
-    """MB5T in-transit quantity: issued (wamng) minus received (wemng). Ordered menge is not used."""
-    issued = find_column(columns, "wamng")
+    """Quantity still to be done: scheduled menge minus received wemng.
+
+    Delivery-completed lines are excluded by the caller. Ordered menge alone is not used.
+    """
+    scheduled = find_column(columns, "menge")
     received = find_column(columns, "wemng")
-    if issued is None or received is None:
+    if scheduled is None or received is None:
         raise DataSourceError(
-            "MB5T stock in transit needs issued quantity (wamng) minus received (wemng). "
-            "Ordered quantity (menge) is not in transit."
+            "Open STO quantity needs scheduled menge minus received wemng. "
+            "A line with delivery documentation already completed is excluded separately."
         )
     return (
-        f"GREATEST({_qty_sql(alias, issued)} - "
+        f"GREATEST({_qty_sql(alias, scheduled)} - "
         f"COALESCE({_qty_sql(alias, received)}, 0), 0)"
     )
 
@@ -329,10 +332,11 @@ def build_open_sto_sql(
     eket_table: Optional[str] = None,
     eket_columns: Optional[Sequence[str]] = None,
 ) -> str:
-    """MB5T stock in transit from W004 to M002, summed by material.
+    """Still-open stock transport from W004 to M002, summed by material.
 
-    In transit is EKET issued quantity (wamng) minus received (wemng).
-    An order that has not been goods-issued does not appear.
+    Keeps purchase orders whose delivery documentation is not completed (elikz blank)
+    and whose scheduled quantity is not yet received. Only the newest document per
+    material is kept, so older orders left open in the extract are not added.
     """
     ebeln_h = _require_column(ekko_columns, "ebeln")
     ebeln_i = _require_column(ekpo_columns, "ebeln")
@@ -357,7 +361,7 @@ def build_open_sto_sql(
     qty_alias = "po"
     qty_columns: Sequence[str] = ekpo_columns
     if eket_table and eket_columns is not None:
-        if find_column(eket_columns, "wamng") and find_column(eket_columns, "wemng"):
+        if find_column(eket_columns, "menge") and find_column(eket_columns, "wemng"):
             ebeln_e = _require_column(eket_columns, "ebeln")
             ebelp_e = _require_column(eket_columns, "ebelp")
             schedule = _and_mandt(
@@ -397,13 +401,23 @@ def build_open_sto_sql(
         if qty_alias == "et" and eket_columns is not None and find_column(eket_columns, snap):
             filters.append(f"et.{quote_column(snap)} = ko.{column}")
     material = _aliased_text("po", matnr)
-    return f"""
+    document = _aliased_text("ko", ebeln_h)
+    detail = f"""
         SELECT
-            {material} AS `Material`,
-            SUM({open_expr}) AS `Open Qty`
+            {material} AS material,
+            {document} AS purchasing_document,
+            {open_expr} AS open_qty
         {' '.join(joins)}
         WHERE {" AND ".join(filters)}
-        GROUP BY {material}
+    """
+    return f"""
+        SELECT material AS `Material`, SUM(open_qty) AS `Open Qty`
+        FROM (
+            SELECT material, purchasing_document, open_qty
+            FROM ({detail}) detail
+            QUALIFY purchasing_document = MAX(purchasing_document) OVER (PARTITION BY material)
+        ) latest
+        GROUP BY material
     """
 
 

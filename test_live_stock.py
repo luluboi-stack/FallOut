@@ -286,8 +286,7 @@ def test_open_sto_sql_uses_received_quantity_not_ordered_quantity():
     )
     assert "INNER JOIN `sap`.`sapabap1`.`eket` et" in sql
     assert "et.`wemng`" in sql
-    assert "et.`wamng`" in sql
-    assert "et.`menge`" not in sql
+    assert "et.`menge`" in sql
     assert "po.`menge`" not in sql
     assert "po.`wemng`" not in sql
     assert "GREATEST" in sql
@@ -296,21 +295,21 @@ def test_open_sto_sql_uses_received_quantity_not_ordered_quantity():
     assert "REGEXP_REPLACE" in sql
     assert "`loekz`" in sql and "`elikz`" in sql
     assert "> 0" in sql
-    assert "QUALIFY" not in sql
+    assert "QUALIFY purchasing_document = MAX(purchasing_document) OVER (PARTITION BY material)" in sql
     assert "current_timestamp()" not in sql
 
     on_item = build_open_sto_sql(
         "sap.sapabap1.ekko",
         "sap.sapabap1.ekpo",
         EKKO_COLS,
-        EKPO_COLS + ["wamng", "wemng"],
+        EKPO_COLS + ["menge", "wemng"],
         None,
         None,
     )
     assert "eket" not in on_item.lower()
-    assert "po.`wamng`" in on_item
+    assert "po.`menge`" in on_item
     assert "po.`wemng`" in on_item
-    with pytest.raises(DataSourceError, match="wamng"):
+    with pytest.raises(DataSourceError, match="wemng"):
         build_open_sto_sql(
             "sap.sapabap1.ekko",
             "sap.sapabap1.ekpo",
@@ -332,8 +331,8 @@ def test_open_sto_keeps_purchase_orders_and_the_newest_document():
     )
     assert "UPPER(TRIM(CAST(ko.`bstyp` AS STRING))) = 'F'" in sql
     assert "LIKE '6%'" not in sql
-    assert "QUALIFY" not in sql
-    assert "wamng" in sql
+    assert "PARTITION BY material" in sql
+    assert "`elikz`" in sql
 
 
 def test_cogi_uses_the_latest_batch_only():
