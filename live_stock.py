@@ -373,6 +373,17 @@ def build_open_sto_sql(
     loekz_h = find_column(ekko_columns, "loekz")
     if loekz_h:
         filters.append(_is_blank("ko", loekz_h))
+    snap = find_column(ekko_columns, "batch_ts", "read_at")
+    if snap:
+        column = quote_column(snap)
+        filters.append(
+            f"ko.{column} = (SELECT MAX(i.{column}) FROM {quote_table(ekko_table)} i "
+            f"WHERE CAST(i.{column} AS TIMESTAMP) <= current_timestamp())"
+        )
+        if find_column(ekpo_columns, snap):
+            filters.append(f"po.{quote_column(snap)} = ko.{column}")
+        if qty_alias == "et" and eket_columns is not None and find_column(eket_columns, snap):
+            filters.append(f"et.{quote_column(snap)} = ko.{column}")
     material = _aliased_text("po", matnr)
     return f"""
         SELECT

@@ -295,6 +295,7 @@ def test_open_sto_sql_uses_received_quantity_not_ordered_quantity():
     assert "REGEXP_REPLACE" in sql
     assert "`loekz`" in sql and "`elikz`" in sql
     assert "> 0" in sql
+    assert "current_timestamp()" not in sql
 
     on_item = build_open_sto_sql(
         "sap.sapabap1.ekko",
@@ -315,6 +316,22 @@ def test_open_sto_sql_uses_received_quantity_not_ordered_quantity():
             None,
             None,
         )
+
+
+def test_open_sto_uses_the_latest_batch_only():
+    sql = build_open_sto_sql(
+        "sap.sapabap1.ekko",
+        "sap.sapabap1.ekpo",
+        EKKO_COLS + ["batch_ts"],
+        EKPO_COLS + ["batch_ts"],
+        "sap.sapabap1.eket",
+        EKET_COLS + ["batch_ts"],
+    )
+    assert "MAX(i.`batch_ts`)" in sql
+    assert "current_timestamp()" in sql
+    assert "po.`batch_ts` = ko.`batch_ts`" in sql
+    assert "et.`batch_ts` = ko.`batch_ts`" in sql
+    assert "et.`wemng`" in sql
 
 
 def test_live_stock_reads_m002_and_w004_from_the_hourly_table(monkeypatch):
