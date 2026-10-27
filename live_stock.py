@@ -28,10 +28,8 @@ from bom_databricks import (
     quote_table,
 )
 
-# Unrestricted storage-location stock (MARD-LABST). Env: DATABRICKS_MARD_TABLE.
-MARD_TABLE = "sap.sapabap1.mard"
-# Stock balance view used when MARD is absent from this catalog. Same labst column.
-MARD_TABLE_FALLBACK = "sap.sapabap1.nsdm_v_mard_hourly"
+# Unrestricted stock for live M002 and W004 (MARD-LABST). Env: DATABRICKS_MARD_TABLE.
+MARD_TABLE = "sap.sapabap1.nsdm_v_mard_hourly"
 # Hourly copies repeat the balance. The true quantity is the latest load, not the sum of every hour.
 STOCK_SNAPSHOT_COLUMNS = (
     "load_timestamp",
@@ -107,7 +105,7 @@ class StockTables:
         cogi_override = str(env.get("DATABRICKS_COGI_TABLE", "") or "").strip()
         cogi_tables = (cogi_override,) if cogi_override else (COGI_TABLE, COGI_TABLE_FALLBACK)
         mard_override = str(env.get("DATABRICKS_MARD_TABLE", "") or "").strip()
-        mard_tables = (mard_override,) if mard_override else (MARD_TABLE, MARD_TABLE_FALLBACK)
+        mard_tables = (mard_override,) if mard_override else (MARD_TABLE,)
         return cls(
             mard_tables=mard_tables,
             cogi_tables=cogi_tables,
@@ -155,7 +153,10 @@ def _qty_sql(alias: str, column: str) -> str:
 
 
 def build_stock_sql(table: str, columns: Sequence[str]) -> str:
-    """Unrestricted labst for the M002 floor buckets and W004 RM01."""
+    """Unrestricted labst for live M002 and W004 from the same stock table.
+
+    M002 floor is RM01 + PS01 + PV01. W004 is RM01, the pick source.
+    """
     matnr = _require_column(columns, "matnr")
     werks = _require_column(columns, "werks")
     lgort = _require_column(columns, "lgort")

@@ -99,7 +99,7 @@ def _render_stock(feeds: PageFeeds) -> None:
     if equation is not None:
         st.subheader("Quantity of every material")
         st.caption(
-            "Unrestricted labst from the latest stock load. "
+            "Unrestricted labst for M002 and W004 from the same live stock table. "
             "m002_raw is M002 RM01 + PS01 + PV01. w004_rm01 is W004 RM01. "
             "A material with no stock row is 0."
         )
