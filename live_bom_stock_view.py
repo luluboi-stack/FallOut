@@ -23,7 +23,6 @@ import pandas as pd
 import streamlit as st
 
 from live_stock import (
-    TOOL_EQUATION,
     WALK_PARENT_PREFIXES,
     PageFeeds,
     compare_bom_stock,
@@ -32,8 +31,7 @@ from live_stock import (
     empty_sto,
     load_demo_feeds,
     load_live_feeds,
-    material_quantities,
-    tool_quantities,
+    unrestricted_buckets,
 )
 
 
@@ -53,24 +51,11 @@ def _show_frame(frame: pd.DataFrame, empty_note: str) -> None:
     st.caption(f"{len(frame)} rows")
 
 
-def _quantities(feeds: PageFeeds) -> pd.DataFrame | None:
-    """Every material's quantity. Blank when unrestricted stock did not load, so a 0 is never a stand-in for a failed read."""
+def _sap_stock(feeds: PageFeeds) -> pd.DataFrame | None:
+    """Current unrestricted balance per material. Not a sequence total and not filtered by the walk."""
     if feeds.stock_error:
         return None
-    cogi = feeds.cogi if not feeds.cogi_error else empty_cogi()
-    sto = feeds.sto if not feeds.sto_error else empty_sto()
-    if feeds.bom_error:
-        frame = tool_quantities(feeds.stock, cogi, sto)
-    else:
-        frame = material_quantities(feeds.bom, feeds.stock, cogi, sto)
-    if feeds.cogi_error:
-        frame = frame.copy()
-        frame["cogi"] = pd.NA
-        frame["m002_effective"] = pd.NA
-    if feeds.sto_error:
-        frame = frame.copy()
-        frame["open_sto"] = pd.NA
-    return frame
+    return unrestricted_buckets(feeds.stock)
 
 
 def _render_bom(feeds: PageFeeds) -> None:
@@ -86,28 +71,27 @@ def _render_bom(feeds: PageFeeds) -> None:
 
 
 def _render_stock(feeds: PageFeeds) -> None:
-    st.caption(TOOL_EQUATION)
     if feeds.stock_table:
-        st.caption(f"Unrestricted stock from {feeds.stock_table}.")
+        st.caption(f"Live M002 and W004 unrestricted stock from {feeds.stock_table}.")
+    else:
+        st.caption("Live M002 and W004 unrestricted stock.")
+    st.caption(
+        "One balance per material. This is not added across sequences and it is not limited to the walk. "
+        "M002 is RM01 + PS01 + PV01 unrestricted. W004 is RM01 unrestricted."
+    )
     if feeds.stock_error:
         st.error(feeds.stock_error)
+    else:
+        st.subheader("SAP unrestricted stock")
+        _show_frame(_sap_stock(feeds), "No stock rows for M002 or W004.")
     if feeds.cogi_error:
         st.error(f"COGI: {feeds.cogi_error}")
-    if feeds.sto_error:
-        st.error(f"Open STO: {feeds.sto_error}")
-    equation = _quantities(feeds)
-    if equation is not None:
-        st.subheader("Quantity of every material")
-        st.caption(
-            "Unrestricted labst for M002 and W004 from the same live stock table. "
-            "m002_raw is M002 RM01 + PS01 + PV01. w004_rm01 is W004 RM01. "
-            "A material with no stock row is 0."
-        )
-        _show_frame(equation, "No materials.")
-    if not feeds.cogi_error:
+    elif not feeds.cogi_error:
         st.subheader("COGI")
         _show_frame(feeds.cogi, "No COGI rows for plant M002.")
-    if not feeds.sto_error:
+    if feeds.sto_error:
+        st.error(f"Open STO: {feeds.sto_error}")
+    else:
         st.subheader("Open STO")
         _show_frame(feeds.sto, "No open stock transport quantity from W004 to M002.")
 
@@ -144,18 +128,6 @@ def _render_checker(feeds: PageFeeds) -> None:
         if checks is None:
             return None
         return checks[name]
-
-    quantities = _quantities(feeds)
-    st.subheader("Quantity of every material")
-    st.caption(
-        "The quantity of each material. m002_raw and w004_rm01 are unrestricted stock. "
-        "open_sto is the open W004 to M002 quantity. cogi is the M002 failed-goods quantity. "
-        "0 means that feed has no row for the material."
-    )
-    if feeds.stock_error:
-        st.error(stock_problem)
-    else:
-        _show_frame(quantities if quantities is not None else pd.DataFrame(), "No materials.")
 
     _section(
         "On the BOM, no unrestricted stock",
