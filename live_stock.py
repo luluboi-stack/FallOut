@@ -30,8 +30,10 @@ from bom_databricks import (
 
 # Unrestricted stock for live M002 and W004 (MARD-LABST). Env: DATABRICKS_MARD_TABLE.
 MARD_TABLE = "sap.sapabap1.nsdm_v_mard_hourly"
-# Hourly copies repeat the balance. The true quantity is the latest load, not the sum of every hour.
+# Hourly copies repeat the balance. batch_ts is the load instant on nsdm_v_mard_hourly.
 STOCK_SNAPSHOT_COLUMNS = (
+    "batch_ts",
+    "read_at",
     "load_timestamp",
     "snapshot_ts",
     "ingestion_timestamp",

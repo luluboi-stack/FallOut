@@ -97,9 +97,9 @@ def test_pv01_unrestricted_counts_in_m002_bucket():
 def test_hourly_stock_uses_the_latest_load_only():
     sql = build_stock_sql(
         "sap.sapabap1.nsdm_v_mard_hourly",
-        MARD_COLS + ["load_timestamp", "insme"],
+        MARD_COLS + ["batch_ts", "insme"],
     )
-    assert "MAX(`load_timestamp`)" in sql
+    assert "MAX(`batch_ts`)" in sql
     assert "`labst`" in sql
     assert "insme" not in sql.lower()
     assert "speme" not in sql.lower()
