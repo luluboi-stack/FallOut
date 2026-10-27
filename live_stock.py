@@ -40,10 +40,10 @@ STOCK_SNAPSHOT_COLUMNS = (
     "di_sequence_number",
     "calday",
 )
-# COGI failed goods movements (AFFW). Env: DATABRICKS_COGI_TABLE.
-COGI_TABLE = "sap.sapabap1.affw"
-# Hourly COGI extract, queried only after AFFW DESCRIBE fails. Env override replaces both.
-COGI_TABLE_FALLBACK = "sap.sapabap1.affw_hourly"
+# COGI failed goods movements for the current load. Env: DATABRICKS_COGI_TABLE.
+COGI_TABLE = "sap.sapabap1.affw_hourly"
+# Current open COGI set, used only when the hourly table is absent.
+COGI_TABLE_FALLBACK = "sap.sapabap1.affw"
 # STO header: supplying plant and document type. Env: DATABRICKS_EKKO_TABLE.
 EKKO_TABLE = "sap.sapabap1.ekko"
 # STO item: material and receiving plant. Env: DATABRICKS_EKPO_TABLE.
@@ -257,13 +257,21 @@ def build_cogi_sql(table: str, columns: Sequence[str]) -> str:
             f"Columns: {list(columns)}"
         )
     material = _aliased_text("c", matnr)
+    snap = find_column(columns, "batch_ts", "read_at")
+    latest = ""
+    if snap:
+        column = quote_column(snap)
+        latest = (
+            f" AND c.{column} = (SELECT MAX(i.{column}) FROM {quote_table(table)} i "
+            f"WHERE CAST(i.{column} AS TIMESTAMP) <= current_timestamp())"
+        )
     return f"""
         SELECT
             {material} AS `Material`,
             SUM({_qty_sql("c", qty)}) AS `Quantity`
         FROM {quote_table(table)} c
         WHERE UPPER({_aliased_text("c", werks)}) = 'M002'
-            AND {material} <> ''
+            AND {material} <> ''{latest}
         GROUP BY {material}
     """
 
@@ -373,6 +381,9 @@ def build_open_sto_sql(
     loekz_h = find_column(ekko_columns, "loekz")
     if loekz_h:
         filters.append(_is_blank("ko", loekz_h))
+    bstyp = find_column(ekko_columns, "bstyp")
+    if bstyp:
+        filters.append(f"UPPER({_aliased_text('ko', bstyp)}) = 'F'")
     snap = find_column(ekko_columns, "batch_ts", "read_at")
     if snap:
         column = quote_column(snap)
@@ -385,13 +396,23 @@ def build_open_sto_sql(
         if qty_alias == "et" and eket_columns is not None and find_column(eket_columns, snap):
             filters.append(f"et.{quote_column(snap)} = ko.{column}")
     material = _aliased_text("po", matnr)
-    return f"""
+    document = _aliased_text("ko", ebeln_h)
+    detail = f"""
         SELECT
-            {material} AS `Material`,
-            SUM({open_expr}) AS `Open Qty`
+            {material} AS material,
+            {document} AS purchasing_document,
+            {open_expr} AS open_qty
         {' '.join(joins)}
         WHERE {" AND ".join(filters)}
-        GROUP BY {material}
+    """
+    return f"""
+        SELECT material AS `Material`, SUM(open_qty) AS `Open Qty`
+        FROM (
+            SELECT material, purchasing_document, open_qty
+            FROM ({detail}) detail
+            QUALIFY purchasing_document = MAX(purchasing_document) OVER (PARTITION BY material)
+        ) latest
+        GROUP BY material
     """
 
 

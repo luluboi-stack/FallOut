@@ -295,6 +295,7 @@ def test_open_sto_sql_uses_received_quantity_not_ordered_quantity():
     assert "REGEXP_REPLACE" in sql
     assert "`loekz`" in sql and "`elikz`" in sql
     assert "> 0" in sql
+    assert "QUALIFY purchasing_document = MAX(purchasing_document) OVER (PARTITION BY material)" in sql
     assert "current_timestamp()" not in sql
 
     on_item = build_open_sto_sql(
@@ -316,6 +317,31 @@ def test_open_sto_sql_uses_received_quantity_not_ordered_quantity():
             None,
             None,
         )
+
+
+def test_open_sto_keeps_purchase_orders_and_the_newest_document():
+    sql = build_open_sto_sql(
+        "sap.sapabap1.ekko",
+        "sap.sapabap1.ekpo",
+        EKKO_COLS + ["bstyp"],
+        EKPO_COLS,
+        "sap.sapabap1.eket",
+        EKET_COLS,
+    )
+    assert "UPPER(TRIM(CAST(ko.`bstyp` AS STRING))) = 'F'" in sql
+    assert "LIKE '6%'" not in sql
+    assert "PARTITION BY material" in sql
+
+
+def test_cogi_uses_the_latest_batch_only():
+    sql = build_cogi_sql(
+        "sap.sapabap1.affw_hourly",
+        ["matnr", "werks", "erfmg", "batch_ts", "menge"],
+    )
+    assert "MAX(i.`batch_ts`)" in sql
+    assert "current_timestamp()" in sql
+    assert "`erfmg`" in sql
+    assert "menge" not in sql.lower()
 
 
 def test_open_sto_uses_the_latest_batch_only():
@@ -383,7 +409,7 @@ def test_cogi_describe_falls_back_only_when_affw_is_absent(monkeypatch):
 
     def query(_conn, sql):
         calls.append(("query", sql))
-        assert "affw_hourly" in sql
+        assert COGI_TABLE_FALLBACK.split(".")[-1] in sql
         assert "`erfmg`" in sql
         assert "menge" not in sql.lower()
         return pd.DataFrame({"Material": ["A"], "Quantity": [1]})
