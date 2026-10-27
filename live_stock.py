@@ -574,10 +574,40 @@ def explode_walk_bom(
     if not keep_idx:
         empty = trimmed.iloc[0:0].copy()
         empty.insert(0, "Walk SKU", pd.Series(dtype=str))
+        empty.insert(1, "Parent as child", pd.Series(dtype=str))
         return empty
     out = trimmed.loc[keep_idx].copy()
     out.insert(0, "Walk SKU", walk_skus)
-    return out.reset_index(drop=True)
+    out = _map_kit_parents(out, parent_col, child_col)
+    front = [column for column in ("Walk SKU", "Parent as child", parent_col, child_col) if column in out.columns]
+    rest = [column for column in out.columns if column not in front]
+    return out.loc[:, front + rest].reset_index(drop=True)
+
+
+def _map_kit_parents(frame: pd.DataFrame, parent_col: str, child_col: str) -> pd.DataFrame:
+    """Map a kit that is both a parent and a child.
+
+    Under an S450, SEL, or SRIZ walk SKU the kit stays the child.
+    Each of that kit's parts stays parent = kit, child = part, and
+    Parent as child repeats the kit on those rows.
+    """
+    parents = {clean_sap_key(value) for value in frame[parent_col]}
+    children = {clean_sap_key(value) for value in frame[child_col]}
+    kits = parents & children
+    kits.discard("")
+    mapped = []
+    for parent, child in zip(frame[parent_col], frame[child_col]):
+        parent_key = clean_sap_key(parent)
+        child_key = clean_sap_key(child)
+        if parent_key in kits:
+            mapped.append(str(parent).strip())
+        elif child_key in kits:
+            mapped.append(str(child).strip())
+        else:
+            mapped.append("")
+    out = frame.copy()
+    out.insert(1, "Parent as child", mapped)
+    return out
 
 
 def bom_material_keys(bom: pd.DataFrame) -> tuple[set[str], set[str]]:

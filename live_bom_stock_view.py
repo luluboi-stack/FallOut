@@ -61,8 +61,9 @@ def _sap_stock(feeds: PageFeeds) -> pd.DataFrame | None:
 def _render_bom(feeds: PageFeeds) -> None:
     prefixes = ", ".join(WALK_PARENT_PREFIXES)
     st.caption(
-        f"Walk SKUs {prefixes}. A child that has another parent is kept as that child "
-        "and its own BOM is exploded under the same walk SKU."
+        f"Walk SKUs {prefixes}. A kit parent is kept as the child of the S450, SEL, or SRIZ SKU. "
+        "Parent as child repeats that kit on every one of its parts. "
+        "Parent Material and Child Material stay the parent-to-child link."
     )
     if feeds.bom_error:
         st.error(feeds.bom_error)

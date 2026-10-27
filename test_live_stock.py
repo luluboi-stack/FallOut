@@ -436,10 +436,10 @@ def test_child_with_another_parent_is_exploded_under_the_walk_sku():
             }
         )
     )
-    links = set(zip(bom["Walk SKU"], bom["Parent Material"], bom["Child Material"]))
-    assert ("S450X", "S450X", "KIT9") in links
-    assert ("S450X", "KIT9", "PART1") in links
-    assert ("S450X", "KIT9", "PART0") in links
+    links = set(zip(bom["Walk SKU"], bom["Parent as child"], bom["Parent Material"], bom["Child Material"]))
+    assert ("S450X", "KIT9", "S450X", "KIT9") in links
+    assert ("S450X", "KIT9", "KIT9", "PART1") in links
+    assert ("S450X", "KIT9", "KIT9", "PART0") in links
     assert "NOISE" not in set(bom["Child Material"])
     stock = pd.DataFrame(
         [
@@ -453,6 +453,24 @@ def test_child_with_another_parent_is_exploded_under_the_walk_sku():
     assert result["missing_unrestricted"]["Walk SKU"].tolist() == ["S450X"]
     assert result["sto_not_on_bom"].empty
     assert result["quantities"].set_index("Material").loc["PART1", "open_sto"] == 4
+
+
+def test_kit_under_a_walk_parent_is_mapped_onto_every_part():
+    bom = explode_walk_bom(
+        pd.DataFrame(
+            {
+                "Parent Material": ["SEL1", "KIT9", "SUB1", "SRIZ2"],
+                "Child Material": ["KIT9", "SUB1", "PARTX", "KIT9"],
+            }
+        )
+    )
+    links = set(zip(bom["Walk SKU"], bom["Parent as child"], bom["Parent Material"], bom["Child Material"]))
+    assert ("SEL1", "KIT9", "SEL1", "KIT9") in links
+    assert ("SEL1", "KIT9", "KIT9", "SUB1") in links
+    assert ("SEL1", "SUB1", "SUB1", "PARTX") in links
+    assert ("SRIZ2", "KIT9", "SRIZ2", "KIT9") in links
+    assert ("SRIZ2", "KIT9", "KIT9", "SUB1") in links
+    assert ("SRIZ2", "SUB1", "SUB1", "PARTX") in links
 
 
 def test_stock_table_names_follow_env():
