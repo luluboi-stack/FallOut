@@ -194,7 +194,10 @@ def _batch_instant_sql(
         return (
             f"s.{column} = (SELECT MAX(i.{column}) FROM {quote_table(table)} i WHERE {window}) AND "
         )
-    return f"s.{column} = (SELECT MAX({column}) FROM {quote_table(table)}) AND "
+    return (
+        f"s.{column} = (SELECT MAX(i.{column}) FROM {quote_table(table)} i "
+        f"WHERE CAST(i.{column} AS TIMESTAMP) <= current_timestamp()) AND "
+    )
 
 
 def build_stock_sql(
@@ -886,6 +889,6 @@ def load_live_feeds(
         stock_period=(
             f"{india_stamp(period_start)} to {india_stamp(period_end)} India time"
             if period_start and period_end
-            else "latest batch"
+            else "live batch at the current time"
         ),
     )

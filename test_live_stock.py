@@ -111,8 +111,9 @@ def test_stock_period_keeps_one_batch_inside_the_hour():
         "sap.sapabap1.nsdm_v_mard_hourly",
         MARD_COLS + ["batch_ts"],
     )
+    assert "current_timestamp()" in plain
+    assert "MAX(i.`batch_ts`)" in plain
     assert "Asia/Kolkata" not in plain
-    assert "MAX(`batch_ts`)" in plain
 
 
 def test_hourly_stock_uses_the_latest_load_only():
@@ -120,7 +121,8 @@ def test_hourly_stock_uses_the_latest_load_only():
         "sap.sapabap1.nsdm_v_mard_hourly",
         MARD_COLS + ["batch_ts", "insme"],
     )
-    assert "MAX(`batch_ts`)" in sql
+    assert "MAX(i.`batch_ts`)" in sql
+    assert "current_timestamp()" in sql
     assert "`labst`" in sql
     assert "insme" not in sql.lower()
     assert "speme" not in sql.lower()
