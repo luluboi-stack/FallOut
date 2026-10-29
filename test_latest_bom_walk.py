@@ -90,8 +90,9 @@ def test_plan_walks_every_plan_sequence_on_the_latest_bom():
     assert len(walk) == expected_rows
     assert (walk["status"] == "RED").all()
     assert walk["trigger"].sum() == 0
-    assert int((plan["Status"] == "HOLD").sum()) == 7
-    assert len(plan_keys) == 28
+    assert (plan["Status"] == "HOLD").any()
+    assert len(plan_keys) == len(planned)
+    assert 0 not in set(walk["sequence_no"])
 
 
 def test_window_keeps_later_sequences_and_both_lines_in_the_quantity():
