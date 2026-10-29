@@ -197,9 +197,13 @@ def init_db():
                 pss_boxes_to_pick INTEGER,
                 starvation_minutes INTEGER,
                 priority TEXT,
-                raw_json TEXT
+                raw_json TEXT,
+                in_visible_window BOOLEAN
             )
         """)
+        audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(material_decision_audit)")}
+        if "in_visible_window" not in audit_cols:
+            conn.execute("ALTER TABLE material_decision_audit ADD COLUMN in_visible_window BOOLEAN")
         init_walk_tables(conn)
 
 init_db()
@@ -2169,7 +2173,11 @@ else:
 st.subheader("🎛️ Viewing, Line & Priority Filters")
 f_col1, f_col2, f_col3, f_col4 = st.columns(4)
 
-line_filter = f_col1.selectbox("Select Line:", ["All", "Line_1", "Line_2"])
+line_filter = f_col1.selectbox(
+    "Select Line:",
+    ["All", "Line_1", "Line_2"],
+    help="Shows parts that appear on that line. Quantities stay the one walk of every PLAN sequence on both lines, limited only by the minute or sequence window.",
+)
 plan_only_df = batches_df[batches_df["Status"].isin(["PLAN", "RUNNING"])].copy()
 
 status_filter = f_col2.selectbox(
@@ -2315,9 +2323,16 @@ if new_walk:
 walk_df = st.session_state["walk_df"]
 walk_run_id = st.session_state["walk_run_id"]
 
-line_walk_df = walk_df if line_filter == "All" else walk_df[walk_df["line"].str.lower() == line_filter.lower()]
+# One walk already allotted every PLAN sequence on both lines.
+# The minute target and manual sequences only choose which of those rows the picklist shows.
 selected_seq_keys = active_seq_keys if active_seq_keys else None
-master_df = consolidate(line_walk_df, selected_seq_keys)
+master_df = consolidate(walk_df, selected_seq_keys)
+line_part_keys = None
+if line_filter != "All" and not walk_df.empty:
+    window_rows = walk_df if not selected_seq_keys else walk_df[walk_df["seq_key"].isin(selected_seq_keys)]
+    line_part_keys = set(
+        window_rows.loc[window_rows["line"].astype(str).str.lower() == line_filter.lower(), "part_key"].astype(str)
+    )
 st.session_state["cached_master_df"] = master_df
 if not walk_df.empty and master_df.empty:
     st.warning("⚠️ No batches selected in the dispatch horizon.")
@@ -2340,6 +2355,12 @@ if write_audit:
     p_col = find_column_by_priority(bom_source, ["parent material", "parent_material", "parent", "sku", "vehicle"])
     
     master_keys = set(audit_df["Part ID"].apply(clean_sap_key)) if not audit_df.empty else set()
+    if walk_df.empty or not active_seq_keys:
+        visible_part_keys = set()
+    else:
+        visible_part_keys = set(
+            walk_df.loc[walk_df["seq_key"].isin(active_seq_keys), "part_key"].astype(str)
+        )
     audit_batch = []
 
     # 1. Log every part on any PLAN sequence of the walk
@@ -2400,6 +2421,7 @@ if write_audit:
                 "pss_boxes_to_pick": int(r["To be picked PSS count"]),
                 "starvation_minutes": int(r["Starvation_Mins"]),
                 "priority": str(r["Priority"]),
+                "in_visible_window": clean_pid in visible_part_keys,
             }
             record_item["raw_json"] = json.dumps(record_item)
             audit_batch.append(record_item)
@@ -2456,6 +2478,7 @@ if write_audit:
                     "pss_boxes_to_pick": 0,
                     "starvation_minutes": 999,
                     "priority": "EXCLUDED",
+                    "in_visible_window": False,
                 }
                 record_item["raw_json"] = json.dumps(record_item)
                 audit_batch.append(record_item)
@@ -2798,6 +2821,9 @@ if not master_df.empty and "Part ID" in master_df.columns:
     )
 
 view_df = master_df.copy()
+if line_part_keys is not None and not view_df.empty:
+    view_df = view_df[view_df["Part ID"].map(clean_sap_key).isin(line_part_keys)].copy()
+screen_df = view_df.copy()
 if not view_df.empty:
     if status_filter != "All Statuses":
         view_df = view_df[view_df["Transfer Status"] == status_filter]
@@ -2812,9 +2838,9 @@ if not view_df.empty:
 # ---------------------------------------------------------
 # OPERATIONAL COMMAND BANNER
 # ---------------------------------------------------------
-ready_df = master_df[master_df["Transfer Status"] == "Ready for Full Transfer"]
-stockout_df = master_df[master_df["Transfer Status"] == "W004 Out of Stock"]
-covered_df = master_df[master_df["Transfer Status"].str.contains("Sufficient|Covered by Open STO")]
+ready_df = screen_df[screen_df["Transfer Status"] == "Ready for Full Transfer"]
+stockout_df = screen_df[screen_df["Transfer Status"] == "W004 Out of Stock"]
+covered_df = screen_df[screen_df["Transfer Status"].str.contains("Sufficient|Covered by Open STO")]
 
 total_skus_to_pick = len(ready_df)
 total_sus_to_pick = int(ready_df["To be picked PSS count"].sum()) if not ready_df.empty else 0
@@ -2854,7 +2880,7 @@ with col_risk:
     """, unsafe_allow_html=True)
 
 with col_health:
-    coverage_pct = round((len(covered_df) / (len(master_df) or 1)) * 100, 1)
+    coverage_pct = round((len(covered_df) / (len(screen_df) or 1)) * 100, 1)
     st.markdown(f"""
     <div style="background: #f8fafc; border-left: 5px solid #94a3b8; border-radius: 8px; padding: 14px 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
         <div style="font-size: 11px; font-weight: 800; color: #475569; text-transform: uppercase;">🛡️ M002 Line Health</div>
