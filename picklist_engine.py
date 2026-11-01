@@ -185,8 +185,11 @@ class StockBalances:
         m002_pv01: Optional[Dict[str, float]] = None,
     ) -> "StockBalances":
         """plant = max(0, RM01 + PS01 - COGI). PV01 is stored but never spent."""
-        keys = set(m002_rm01) | set(m002_ps01) | set(cogi)
-        m002 = {k: float(m002_rm01.get(k, 0.0)) + float(m002_ps01.get(k, 0.0)) for k in keys}
+        # REPLACE WITH THIS:
+        pv01 = m002_pv01 or {}
+        keys = set(m002_rm01) | set(m002_ps01) | set(pv01) | set(cogi)
+        # PV01 Unrestricted is now included in total plant on-hand
+        m002 = {k: float(m002_rm01.get(k, 0.0)) + float(m002_ps01.get(k, 0.0)) + float(pv01.get(k, 0.0)) for k in keys}
         plant = {k: max(0.0, m002[k] - float(cogi.get(k, 0.0))) for k in keys}
         return cls(
             plant=plant,
