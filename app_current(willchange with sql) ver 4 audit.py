@@ -2344,7 +2344,8 @@ if write_audit:
     run_id = walk_run_id
     audit_df = consolidate(walk_df, None)
     sto_taken_by_part = walk_df.groupby("part_key")["sto_taken"].sum().to_dict() if not walk_df.empty else {}
-    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = extract_detailed_stock_maps(mb52_in)
+    # Line 1175:
+    m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = extract_detailed_stock_maps(mb52_in, lx02_in)
     sto_q_map, sto_po_map = process_open_sto(sto_in)
 
     # Load BOM to identify every part in the plant
@@ -2376,6 +2377,10 @@ if write_audit:
             m_pv01 = m002_pv01_map.get(clean_pid, 0.0)
             w_rm01 = w004_rm01_map.get(clean_pid, 0.0)
             sto_val = sto_q_map.get(clean_pid, 0.0)
+            cogi_val = float(r.get("COGI Qty", 0))
+            gross_m002 = m_rm01 + m_ps01 + m_pv01
+            m002_effective = max(0.0, gross_m002 - cogi_val)
+            pipeline_total = m002_effective + sto_val
 
             status, code, reason = audit_decision(
                 str(r["Transfer Status"]), float(sto_taken_by_part.get(clean_pid, 0.0))
@@ -2405,14 +2410,14 @@ if write_audit:
                 "m002_rm01": float(m_rm01),
                 "m002_ps01": float(m_ps01),
                 "m002_pv01": float(m_pv01),
-                "m002_effective_avail": float(m_rm01 + m_ps01 - r.get("COGI Qty", 0)),
+                "m002_effective_avail": float(m002_effective),
                 "w004_rm01": float(w_rm01),
                 "w004_total": float(w004_tot_map.get(clean_pid, 0.0)),
-                "cogi_error_qty": float(r.get("COGI Qty", 0)),
+                "cogi_error_qty": cogi_val,
                 "open_sto_in_transit": float(sto_val),
                 "open_po_numbers": str(r.get("Open PO Numbers", "")),
                 "truck_scanned_qty": 0.0,
-                "effective_pipeline_total": float(r.get("Total M002 Pipeline", 0)),
+                "effective_pipeline_total": float(pipeline_total),
                 "picklist_status": status,
                 "decision_code": code,
                 "decision_reason": reason,
@@ -2437,6 +2442,12 @@ if write_audit:
                 box_sz, p_type = get_official_pss(raw_child)
                 w_rm01 = w004_rm01_map.get(clean_child, 0.0)
                 m_rm01 = m002_rm01_map.get(clean_child, 0.0)
+                m_ps01 = m002_ps01_map.get(clean_child, 0.0)
+                m_pv01 = m002_pv01_map.get(clean_child, 0.0)
+                sto_val = sto_q_map.get(clean_child, 0.0)
+
+                # ✅ True M002 calculation for excluded batches including PS01, PV01, and STO
+                gross_m002_excluded = m_rm01 + m_ps01 + m_pv01
 
                 record_item = {
                     "audit_run_id": run_id,
@@ -2460,16 +2471,16 @@ if write_audit:
                     "gross_batch_demand": 0.0,
                     "total_horizon_demand": 0.0,
                     "m002_rm01": float(m_rm01),
-                    "m002_ps01": float(m002_ps01_map.get(clean_child, 0.0)),
-                    "m002_pv01": float(m002_pv01_map.get(clean_child, 0.0)),
-                    "m002_effective_avail": float(m_rm01),
+                    "m002_ps01": float(m_ps01),
+                    "m002_pv01": float(m_pv01),
+                    "m002_effective_avail": float(gross_m002_excluded),
                     "w004_rm01": float(w_rm01),
                     "w004_total": float(w_rm01),
                     "cogi_error_qty": 0.0,
-                    "open_sto_in_transit": float(sto_q_map.get(clean_child, 0.0)),
+                    "open_sto_in_transit": float(sto_val),
                     "open_po_numbers": "",
                     "truck_scanned_qty": 0.0,
-                    "effective_pipeline_total": float(m_rm01),
+                    "effective_pipeline_total": float(gross_m002_excluded + sto_val),
                     "picklist_status": "REJECTED",
                     "decision_code": "REJECTED_HORIZON_CUTOFF",
                     "decision_reason": "Part is not on any PLAN sequence in this walk (not scheduled, or HOLD).",
@@ -2482,7 +2493,7 @@ if write_audit:
                 }
                 record_item["raw_json"] = json.dumps(record_item)
                 audit_batch.append(record_item)
-
+                
     # Commit all parts to SQLite
     st.session_state["drive_result"] = record_audit_run(run_id, audit_batch)
 
@@ -2495,6 +2506,8 @@ elif drive_result.status == PICKLIST_SKIPPED:
     st.sidebar.caption(f"☁️ {drive_result.message}")
 else:
     st.sidebar.error(f"☁️ {drive_result.message}")
+
+
 
 
 # ---------------------------------------------------------
