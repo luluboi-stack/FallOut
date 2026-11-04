@@ -2193,18 +2193,27 @@ hide_hold = sf_col1.checkbox("Hide HOLD Batches", value=True)
 
 selection_mode = sf_col2.selectbox(
     "Filter Scope By:",
-    ["⏱️ Target Qty / Minutes (e.g. 180m)", "🔢 Manual Sequence Numbers", "⚡ All Sequences"]
+    [
+        "⏱️ Target Qty / Minutes (e.g. 180m)",
+        "🔢 Manual Sequence Numbers",
+        "⚡ All Sequences",
+    ],
 )
 
 target_dispatch_qty = None
 manual_selected_seqs = []
 
 if selection_mode.startswith("⏱️"):
-    target_dispatch_qty = sf_col3.number_input(
-        "Enter Target Production Order Qty / Minutes:",
-        min_value=30, max_value=600, value=180, step=30,
-        help="e.g. 180 = 180 minutes of production (~180 scooters/line)."
-    )
+  # 👈 Changed from number_input to selectbox with 180 or 240 options
+  target_dispatch_qty = sf_col3.selectbox(
+      "Select Production Horizon Minutes:",
+      options=[180, 240],
+      index=0,  # Defaults to 180
+      help=(
+          "Select target production window: 180 minutes or 240 minutes"
+          " (~180 or ~240 scooters/line)."
+      ),
+  )
 elif selection_mode.startswith("🔢"):
     manual_selected_seqs = sf_col3.multiselect(
         "Select Specific Sequences:",
@@ -2378,7 +2387,7 @@ if write_audit:
             w_rm01 = w004_rm01_map.get(clean_pid, 0.0)
             sto_val = sto_q_map.get(clean_pid, 0.0)
             cogi_val = float(r.get("COGI Qty", 0))
-            gross_m002 = m_rm01 + m_ps01 + m_pv01
+            gross_m002 = m_rm01 + m_ps01
             m002_effective = max(0.0, gross_m002 - cogi_val)
             pipeline_total = m002_effective + sto_val
 
@@ -2447,7 +2456,7 @@ if write_audit:
                 sto_val = sto_q_map.get(clean_child, 0.0)
 
                 # ✅ True M002 calculation for excluded batches including PS01, PV01, and STO
-                gross_m002_excluded = m_rm01 + m_ps01 + m_pv01
+                gross_m002_excluded = m_rm01 + m_ps01
 
                 record_item = {
                     "audit_run_id": run_id,
@@ -2639,7 +2648,7 @@ with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All P
                                 elif not is_in_active:
                                     st.warning(f"- **{b['Line']} Seq #{b_seq} ({b['SKUName']}):** Beyond current horizon cutoff (Selected horizon excludes Seq #{b_seq}).")
                                 else:
-                                    st.info(f"- **{b['Line']} Seq #{b_seq} ({b['SKUName']}):** In horizon, but floor pipeline (`{int(m_rm01 + m_ps01 + open_sto_val)}` pcs) covers total batch demand.")
+                                    eff_diag_pipeline = max(0.0, (m_rm01 + m_ps01) - cogi_val) + open_sto_val st.info( f"- **{b['Line']} Seq #{b_seq} ({b['SKUName']}):** In horizon, but floor" f" pipeline (`{int(eff_diag_pipeline)}` pcs) covers total batch demand." )
                         else:
                             st.error(f"2. **Production Plan Check:** ❌ None of the parent SKUs (`{', '.join(parent_skus)}`) are scheduled in today's ScaleX batches.")
                     else:
@@ -2665,6 +2674,7 @@ with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All P
         m002_rm01_map, m002_ps01_map, m002_pv01_map, w004_rm01_map, w004_tot_map = (
         extract_detailed_stock_maps(mb52_in, lx02_raw) )
         sto_q_map, _ = process_open_sto(sto_in)
+        cogi_map = process_cogi_dump(cogi_in)
 
         # 2. Build indexed lookup of master_df for fast matching
         master_lookup = {}
@@ -2723,10 +2733,11 @@ with st.expander("🔎 Universal Part Auditor & Trigger Root-Cause Engine (All P
             else:
                 pid = clean_p
                 w004 = int(w004_rm01_map.get(clean_p, 0) or w004_tot_map.get(clean_p, 0))
-                m002_eff = int(m002_rm01_map.get(clean_p, 0) + m002_ps01_map.get(clean_p, 0) + sto_q_map.get(clean_p, 0))
+                clean_cogi = cogi_map.get(clean_p, 0.0)
+                usable_floor = max(0.0, (m002_rm01_map.get(clean_p, 0.0) + m002_ps01_map.get(clean_p, 0.0)) - clean_cogi)
+                m002_eff = int(usable_floor + sto_q_map.get(clean_p, 0.0))
                 demand = 0
                 pick_q = 0
-                seq_val = "Not Active"
 
                 # Check why it didn't enter master_df
                 parent_models = list(bom_parent_map.get(clean_p, []))
