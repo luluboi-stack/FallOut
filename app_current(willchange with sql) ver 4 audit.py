@@ -27,6 +27,11 @@ from data_sources import (
     frame_fingerprint,
 )
 from picklist_drive import PICKLIST_SKIPPED, PicklistCopyResult, append_run_json
+from picklist_download_vault import (
+    DownloadFilters,
+    bom_child_ids,
+    record_master_picklist_download,
+)
 from picklist_engine import (
     StockBalances,
     audit_decision,
@@ -2986,7 +2991,11 @@ def split_picklist_by_equipment(df_pick: pd.DataFrame, num_pickers: int) -> List
 
     return results
 
-def render_landscape_printable_view(df_subset: pd.DataFrame, sheet_title: str):
+def render_landscape_printable_view(
+    df_subset: pd.DataFrame,
+    sheet_title: str,
+    on_download: Optional[Any] = None,
+):
     df_print = df_subset.copy().reset_index(drop=True)
     df_print.insert(0, "S No", df_print.index + 1)
     
@@ -3017,7 +3026,17 @@ def render_landscape_printable_view(df_subset: pd.DataFrame, sheet_title: str):
 
     c_btn1, c_btn2 = st.columns([1, 4])
     csv_data = df_print.to_csv(index=False).encode("utf-8")
-    c_btn1.download_button("⬇️ Export CSV", data=csv_data, file_name=f"{sheet_title.replace(' ', '_')}.csv", mime="text/csv", key=f"csv_{sheet_title}")
+    download_kwargs = {
+        "label": "⬇️ Export CSV",
+        "data": csv_data,
+        "file_name": f"{sheet_title.replace(' ', '_')}.csv",
+        "mime": "text/csv",
+        "key": f"csv_{sheet_title}",
+    }
+    # Consolidated master passes on_download to persist audit_vault/picklist/.
+    if on_download is not None:
+        download_kwargs["on_click"] = on_download
+    c_btn1.download_button(**download_kwargs)
 
     table_id = f"table_{re.sub(r'[^a-zA-Z0-9_]', '', sheet_title)}"
     
@@ -3226,7 +3245,56 @@ with tab_pickers:
             op_tabs = st.tabs(tab_labels)
 
             with op_tabs[0]:
-                render_landscape_printable_view(picklist_display, sheet_title="Consolidated Warehouse Master")
+                def persist_consolidated_master_download():
+                    # Walk-time audit stays in runs_*; this writes audit_vault/picklist/ only.
+                    full_master = consolidate(walk_df, None) if walk_df is not None else master_df
+                    sto_taken_map = (
+                        walk_df.groupby("part_key")["sto_taken"].sum().to_dict()
+                        if walk_df is not None and not walk_df.empty else {}
+                    )
+                    bom_source = get_master_bom_df()
+                    child_col = find_column_by_priority(
+                        bom_source, ["child material", "child_material", "component", "material", "part"]
+                    )
+                    filters = DownloadFilters(
+                        line_filter=str(line_filter),
+                        status_filter=str(status_filter),
+                        pss_filter=str(pss_filter),
+                        search_text=str(search_text or ""),
+                        hide_hold=bool(hide_hold),
+                        selection_mode=str(selection_mode),
+                        target_dispatch_qty=int(target_dispatch_qty) if target_dispatch_qty else None,
+                        manual_selected_seqs=tuple(manual_selected_seqs or ()),
+                        active_seq_keys=tuple(sorted(active_seq_keys or ())),
+                        cutoff_seq_keys=tuple(sorted(cutoff_seq_keys or ())),
+                    )
+                    st.session_state["picklist_download_vault_result"] = record_master_picklist_download(
+                        audit_vault_dir=AUDIT_VAULT_DIR,
+                        walk_run_id=walk_run_id,
+                        snapshot_id=str(sap_snapshot.snapshot_id if sap_snapshot else ""),
+                        filters=filters,
+                        full_master=full_master,
+                        window_master=master_df,
+                        downloaded_df=picklist_display,
+                        sto_taken_by_part=sto_taken_map,
+                        bom_part_ids=bom_child_ids(bom_source, child_col),
+                        descriptions=part_descriptions,
+                        pss_lookup=lambda pid: get_official_pss(pid),
+                        client_ip=get_client_ip(),
+                    )
+
+                render_landscape_printable_view(
+                    picklist_display,
+                    sheet_title="Consolidated Warehouse Master",
+                    on_download=persist_consolidated_master_download,
+                )
+                vault_dl = st.session_state.get("picklist_download_vault_result")
+                if vault_dl is None:
+                    st.caption("🗂️ Consolidated master Export CSV also archives trigger rows under audit_vault/picklist/.")
+                elif vault_dl.ok:
+                    st.caption(f"🗂️ {vault_dl.message}")
+                else:
+                    st.caption(f"🗂️ {vault_dl.message}")
 
             for idx, (tab_name, subtitle, op_df) in enumerate(picker_workloads):
                 with op_tabs[idx + 1]:
